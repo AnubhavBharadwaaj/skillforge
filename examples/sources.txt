@@ -1,0 +1,12 @@
+# SkillForge Sample Sources — one per line
+# Supports: arXiv IDs, GitHub URLs, local PDF paths
+
+# Quantization & Compression
+2103.13630
+1510.00149
+
+# Transformer Architectures
+1706.03762
+
+# GitHub Repos
+https://github.com/wolfecameron/nanoMoE
