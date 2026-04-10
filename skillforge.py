@@ -148,14 +148,18 @@ def parse_json_from_llm(text):
 # OPENROUTER — LIVE MODEL DISCOVERY + RANKING ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Hardcoded fallback — used ONLY if live API discovery fails
+# Hardcoded fallback — PROVEN WORKING models, used if live API discovery fails
 OPENROUTER_FALLBACK_MODELS = [
     "google/gemini-2.5-flash-preview:free",
+    "google/gemini-2.5-pro-exp-03-25:free",
     "deepseek/deepseek-chat-v3-0324:free",
-    "google/gemma-3-27b-it:free",
     "meta-llama/llama-4-maverick:free",
+    "meta-llama/llama-4-scout:free",
     "qwen/qwen3-235b-a22b:free",
+    "google/gemma-3-27b-it:free",
     "microsoft/phi-4-reasoning-plus:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+    "deepseek/deepseek-r1-0528:free",
 ]
 
 # Cache: avoid hitting /models every run
@@ -189,44 +193,111 @@ def _discover_free_models(api_key):
         print("   ⚠ No models returned, using fallback pool")
         return None
 
-    # ── Filter: free + text output + sufficient context ──
+    # ── Filter: strict — only real text-gen chat models ──
+    # Many "free" models are vision encoders, music generators, embedding
+    # models, or overloaded behemoths that return blank. Filter aggressively.
+
+    # Blacklist: models that technically list "text" output but aren't chat models
+    BLACKLIST_PATTERNS = [
+        "lyria",           # Google's music generation model
+        "clip",            # Vision encoder, not text gen
+        "imagen",          # Image generation
+        "music",           # Music models
+        "whisper",         # Audio transcription
+        "embedding",       # Embedding models
+        "rerank",          # Reranking models
+        "tts",             # Text-to-speech
+        "stable-diffusion",# Image gen
+        "sdxl",            # Image gen
+        "flux",            # Image gen
+        "dall-e",          # Image gen
+        "moderation",      # Content moderation
+        "guard",           # Safety classifier
+        "vision-only",     # Vision-only
+        "ocr",             # OCR models
+        "jina",            # Embedding/rerank
+        "nomic",           # Embedding
+        "voyage",          # Embedding
+    ]
+
+    # Require these params — proves it's a real chat model
+    REQUIRED_PARAMS = {"temperature", "max_tokens"}
+
     free = []
+    skipped_reasons = {"non_free": 0, "blacklisted": 0, "no_text_io": 0,
+                       "short_context": 0, "low_completion": 0, "no_chat_params": 0}
+
     for m in models:
         mid = m.get("id", "")
+        mid_lower = mid.lower()
+        name_lower = m.get("name", "").lower()
         pricing = m.get("pricing", {})
         prompt_cost = pricing.get("prompt", "1")
         completion_cost = pricing.get("completion", "1")
 
-        # Must be free (price = "0" or 0)
+        # Must be free
         if str(prompt_cost) not in ("0", "0.0", "0.00") or str(completion_cost) not in ("0", "0.0", "0.00"):
+            skipped_reasons["non_free"] += 1
             continue
 
-        # Must support text output
+        # Blacklist check — name or ID contains non-chat model keywords
+        if any(bl in mid_lower or bl in name_lower for bl in BLACKLIST_PATTERNS):
+            skipped_reasons["blacklisted"] += 1
+            continue
+
+        # Must have text input AND text output
         arch = m.get("architecture", {})
+        in_modalities = arch.get("input_modalities", [])
         out_modalities = arch.get("output_modalities", [])
         if out_modalities and "text" not in out_modalities:
+            skipped_reasons["no_text_io"] += 1
+            continue
+        if in_modalities and "text" not in in_modalities:
+            skipped_reasons["no_text_io"] += 1
             continue
 
-        # Must have sufficient context for paper extraction (>= 16K)
+        # Must be text→text or text+image→text (not image→image, audio→text, etc.)
+        modality = arch.get("modality", "")
+        if modality and "text" not in modality:
+            skipped_reasons["no_text_io"] += 1
+            continue
+
+        # Must have sufficient context (≥32K — papers are big)
         ctx = m.get("context_length", 0)
-        if ctx < 16000:
+        if ctx < 32000:
+            skipped_reasons["short_context"] += 1
             continue
 
-        # Must have reasonable completion length (>= 4K)
+        # Must support basic chat params — proves it's a real LLM
+        supported = set(m.get("supported_parameters", []))
+        if not REQUIRED_PARAMS.issubset(supported):
+            skipped_reasons["no_chat_params"] += 1
+            continue
+
+        # Must have reasonable completion cap (≥4K tokens for skill file output)
         top_p = m.get("top_provider", {})
-        max_completion = top_p.get("max_completion_tokens", 4096)
+        max_completion = top_p.get("max_completion_tokens") or 4096
+        if max_completion < 4000:
+            skipped_reasons["low_completion"] += 1
+            continue
 
         free.append({
             "id": mid,
             "name": m.get("name", mid),
             "context_length": ctx,
-            "max_completion": max_completion or 4096,
+            "max_completion": max_completion,
             "created": m.get("created", 0),
             "supported_params": m.get("supported_parameters", []),
             "description": m.get("description", ""),
         })
 
+    # Log filtering stats
+    total_skipped = sum(skipped_reasons.values())
+    print(f"   ✓ {len(models)} total → {len(free)} passed filters ({total_skipped} rejected)")
     if not free:
+        # Show why everything got filtered
+        for reason, count in skipped_reasons.items():
+            if count: print(f"      {reason}: {count}")
         print("   ⚠ No free models matched filters, using fallback pool")
         return None
 
