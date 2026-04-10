@@ -39,21 +39,21 @@ I built this while competing in WorldQuant IQC and OpenAI Parameter Golf, where 
 ## Quickstart
 
 ```bash
-pip install anthropic PyMuPDF google-generativeai
+pip install anthropic PyMuPDF google-generativeai openai
 ```
 
 ```bash
 # arXiv paper → skill file
-python skillforge.py --arxiv 2103.13630 --provider gemini --model gemini-2.5-flash
+python skillforge.py --arxiv 2103.13630 --provider openrouter 
 
 # GitHub repo → skill file
-python skillforge.py --github https://github.com/wolfecameron/nanoMoE --provider gemini
+python skillforge.py --github https://github.com/wolfecameron/nanoMoE --provider openrouter
 
 # Local PDF → skill file
 python skillforge.py --pdf paper.pdf --provider anthropic
 
 # Batch mode — mixed sources in one file
-python skillforge.py batch --list sources.txt --provider gemini --model gemini-2.5-flash
+python skillforge.py batch --list sources.txt --provider openrouter 
 
 # Zero-cost mode — extract text locally, no API calls
 python skillforge.py --arxiv 2103.13630 --no-llm

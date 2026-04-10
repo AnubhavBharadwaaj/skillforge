@@ -28,7 +28,61 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import argparse, datetime, json, os, re, shutil, subprocess
 import sys, tempfile, time, urllib.request
+import threading
 from pathlib import Path
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TERMINAL SPINNER — keeps terminal alive during API calls
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class Spinner:
+    """Animated spinner that runs during long API calls.
+    Usage:
+        with Spinner("Extracting chunk 1/3"):
+            result = llm.call(...)
+    """
+    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message="Working", show_elapsed=True):
+        self.message = message
+        self.show_elapsed = show_elapsed
+        self._stop = threading.Event()
+        self._thread = None
+        self._start_time = None
+
+    def __enter__(self):
+        self._start_time = time.time()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self._stop.set()
+        self._thread.join()
+        elapsed = time.time() - self._start_time
+        # Clear spinner line and print completion
+        sys.stdout.write(f"\r   ✓ {self.message} ({elapsed:.1f}s)\033[K\n")
+        sys.stdout.flush()
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            elapsed = time.time() - self._start_time
+            if self.show_elapsed:
+                line = f"\r   {frame} {self.message} [{elapsed:.0f}s]"
+            else:
+                line = f"\r   {frame} {self.message}"
+            sys.stdout.write(f"{line}\033[K")
+            sys.stdout.flush()
+            i += 1
+            self._stop.wait(0.1)
+
+    def update(self, new_message):
+        """Update message mid-spin."""
+        self.message = new_message
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -123,8 +177,9 @@ def _discover_free_models(api_key):
         "User-Agent": "SkillForge/4.0",
     })
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+        with Spinner("Fetching model registry"):
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"   ⚠ Discovery failed ({e}), using fallback pool")
         return None
@@ -454,6 +509,12 @@ class LLMProvider:
                         continue
                     return ""
 
+                # ── OpenRouter: rotate on empty/blank response ──
+                if self.provider == "openrouter" and ("empty response" in err_str or "blank content" in err_str):
+                    if self._rotate_model(self.model, "empty_response"):
+                        continue
+                    return ""
+
                 # ── Non-OpenRouter rate limit ──
                 if self._is_rate_limit(e):
                     wait = (attempt + 1) * 30
@@ -474,33 +535,32 @@ class LLMProvider:
 
     def _generate_inner(self, system_prompt, user_message, max_tokens, json_mode=False):
         if self.provider == "anthropic":
-            msg = self.client.messages.create(
-                model=self.model, max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-            )
+            with Spinner(f"Generating via {self.model.split('/')[-1][:25]}"):
+                msg = self.client.messages.create(
+                    model=self.model, max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_message}],
+                )
             print(f"   [{self.provider}] {msg.usage.input_tokens:,} in / {msg.usage.output_tokens:,} out")
             return msg.content[0].text
 
         elif self.provider == "gemini":
             gm = self._genai.GenerativeModel(self.model, system_instruction=system_prompt)
-            # Build generation config
             gen_config = {"max_output_tokens": max_tokens, "temperature": 0.2}
-            # json_mode: force JSON output + disable thinking (fixes 0/10 validation on 2.5 models)
             if json_mode:
                 gen_config["response_mime_type"] = "application/json"
-            try:
-                resp = gm.generate_content(
-                    user_message,
-                    generation_config=self._genai.types.GenerationConfig(**gen_config),
-                )
-            except TypeError:
-                # Fallback if response_mime_type not supported in this package version
-                gen_config.pop("response_mime_type", None)
-                resp = gm.generate_content(
-                    user_message,
-                    generation_config=self._genai.types.GenerationConfig(**gen_config),
-                )
+            with Spinner(f"Generating via {self.model}"):
+                try:
+                    resp = gm.generate_content(
+                        user_message,
+                        generation_config=self._genai.types.GenerationConfig(**gen_config),
+                    )
+                except TypeError:
+                    gen_config.pop("response_mime_type", None)
+                    resp = gm.generate_content(
+                        user_message,
+                        generation_config=self._genai.types.GenerationConfig(**gen_config),
+                    )
             # Check for safety block before accessing .text
             if not resp.candidates or not resp.candidates[0].content.parts:
                 fr = resp.candidates[0].finish_reason if resp.candidates else "unknown"
@@ -527,8 +587,17 @@ class LLMProvider:
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            resp = self.client.chat.completions.create(**kwargs)
+            with Spinner(f"Generating via {model_short}"):
+                resp = self.client.chat.completions.create(**kwargs)
+
+            # Guard against None responses
+            if not resp or not resp.choices or not resp.choices[0].message:
+                print(f"   ⚠ {model_short} returned empty response")
+                raise RuntimeError(f"Empty response from {self.model} — rotating")
             text = resp.choices[0].message.content or ""
+            if not text.strip():
+                print(f"   ⚠ {model_short} returned blank content")
+                raise RuntimeError(f"Blank content from {self.model} — rotating")
             # Token logging
             if resp.usage:
                 print(f"   [openrouter/{model_short}] {resp.usage.prompt_tokens:,} in / {resp.usage.completion_tokens:,} out")
@@ -578,13 +647,18 @@ class LLMProvider:
             # Use same rotation-aware generate path
             for attempt in range(len(self._model_pool) + 2):
                 try:
-                    resp = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=api_messages,
-                        max_tokens=max_tokens,
-                        temperature=0.2,
-                    )
+                    with Spinner(f"Multi-turn via {model_short}"):
+                        resp = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=api_messages,
+                            max_tokens=max_tokens,
+                            temperature=0.2,
+                        )
+                    if not resp or not resp.choices or not resp.choices[0].message:
+                        raise RuntimeError(f"Empty response from {self.model}")
                     text = resp.choices[0].message.content or ""
+                    if not text.strip():
+                        raise RuntimeError(f"Blank content from {self.model}")
                     if resp.usage:
                         print(f"   [openrouter/{model_short}] {resp.usage.prompt_tokens:,} in / {resp.usage.completion_tokens:,} out")
                     else:
@@ -592,7 +666,7 @@ class LLMProvider:
                     self._call_count += 1
                     return text
                 except Exception as e:
-                    if self._is_rate_limit(e):
+                    if self._is_rate_limit(e) or "empty response" in str(e).lower() or "blank content" in str(e).lower():
                         if self._rotate_model(self.model, "rate_limit"):
                             model_short = self.model.split("/")[-1][:25]
                             continue
@@ -1027,11 +1101,10 @@ def skip_dir(d): return d in SKIP_DIRS or d.endswith(".egg-info")
 def clone_repo(url, dest):
     url = url.rstrip("/")
     if not url.endswith(".git"): url += ".git"
-    print(f"⏳ Cloning {url} …")
-    r = subprocess.run(["git","clone","--depth","1","--single-branch",url,dest],
-                       capture_output=True, text=True)
+    with Spinner(f"Cloning {url.split('/')[-1]}"):
+        r = subprocess.run(["git","clone","--depth","1","--single-branch",url,dest],
+                           capture_output=True, text=True)
     if r.returncode != 0: print(f"❌ git clone failed:\n{r.stderr}",file=sys.stderr); sys.exit(1)
-    print("✅ Clone complete.")
 
 def extract_repo_meta(url):
     url = url.rstrip("/")
@@ -1255,10 +1328,10 @@ def download_arxiv(aid, od="/tmp"):
     aid = aid.replace(".pdf","").split("v")[0]
     url = f"https://arxiv.org/pdf/{aid}.pdf"
     out = os.path.join(od, f"{aid.replace('/','_')}.pdf")
-    print(f"⏳ Downloading {url} …")
-    req = urllib.request.Request(url, headers={"User-Agent":"SkillForge/3.0"})
-    with urllib.request.urlopen(req) as r, open(out,"wb") as f: f.write(r.read())
-    print(f"✅ Downloaded to {out}")
+    with Spinner(f"Downloading {url}"):
+        req = urllib.request.Request(url, headers={"User-Agent":"SkillForge/4.0"})
+        with urllib.request.urlopen(req) as r, open(out,"wb") as f: f.write(r.read())
+    print(f"   📥 Saved to {out}")
     return out
 
 def extract_pdf(path, max_p=40):
