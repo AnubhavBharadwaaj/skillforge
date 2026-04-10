@@ -15,10 +15,11 @@ Usage:
   python skillforge.py --pdf paper.pdf
   python skillforge.py batch --list sources.txt
   python skillforge.py --arxiv 2103.13630 --provider gemini --model gemini-2.5-flash
+  python skillforge.py --arxiv 2103.13630 --provider openrouter
   python skillforge.py --arxiv 2103.13630 --no-llm
 
 Install:
-  pip install anthropic PyMuPDF google-generativeai
+  pip install anthropic PyMuPDF google-generativeai openai
 """
 
 import warnings
@@ -41,6 +42,10 @@ def _require_anthropic():
 def _require_gemini():
     try: import google.generativeai as genai; return genai
     except ImportError: print("❌ pip install google-generativeai"); sys.exit(1)
+
+def _require_openai():
+    try: import openai; return openai
+    except ImportError: print("❌ pip install openai"); sys.exit(1)
 
 def _require_fitz():
     try: import fitz; return fitz
@@ -86,7 +91,241 @@ def parse_json_from_llm(text):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LLM PROVIDER — v3: safe_generate with retry + safety catch
+# OPENROUTER — LIVE MODEL DISCOVERY + RANKING ENGINE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Hardcoded fallback — used ONLY if live API discovery fails
+OPENROUTER_FALLBACK_MODELS = [
+    "google/gemini-2.5-flash-preview:free",
+    "deepseek/deepseek-chat-v3-0324:free",
+    "google/gemma-3-27b-it:free",
+    "meta-llama/llama-4-maverick:free",
+    "qwen/qwen3-235b-a22b:free",
+    "microsoft/phi-4-reasoning-plus:free",
+]
+
+# Cache: avoid hitting /models every run
+_MODEL_CACHE = {"models": None, "ts": 0, "ttl": 3600}  # 1 hour TTL
+
+
+def _discover_free_models(api_key):
+    """Hit OpenRouter /api/v1/models, filter free, rank by composite score."""
+    import urllib.request, urllib.error
+
+    # Check cache
+    if _MODEL_CACHE["models"] and (time.time() - _MODEL_CACHE["ts"]) < _MODEL_CACHE["ttl"]:
+        return _MODEL_CACHE["models"]
+
+    print("   🔍 Discovering free models from OpenRouter…")
+    url = "https://openrouter.ai/api/v1/models"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "SkillForge/4.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"   ⚠ Discovery failed ({e}), using fallback pool")
+        return None
+
+    models = raw.get("data", [])
+    if not models:
+        print("   ⚠ No models returned, using fallback pool")
+        return None
+
+    # ── Filter: free + text output + sufficient context ──
+    free = []
+    for m in models:
+        mid = m.get("id", "")
+        pricing = m.get("pricing", {})
+        prompt_cost = pricing.get("prompt", "1")
+        completion_cost = pricing.get("completion", "1")
+
+        # Must be free (price = "0" or 0)
+        if str(prompt_cost) not in ("0", "0.0", "0.00") or str(completion_cost) not in ("0", "0.0", "0.00"):
+            continue
+
+        # Must support text output
+        arch = m.get("architecture", {})
+        out_modalities = arch.get("output_modalities", [])
+        if out_modalities and "text" not in out_modalities:
+            continue
+
+        # Must have sufficient context for paper extraction (>= 16K)
+        ctx = m.get("context_length", 0)
+        if ctx < 16000:
+            continue
+
+        # Must have reasonable completion length (>= 4K)
+        top_p = m.get("top_provider", {})
+        max_completion = top_p.get("max_completion_tokens", 4096)
+
+        free.append({
+            "id": mid,
+            "name": m.get("name", mid),
+            "context_length": ctx,
+            "max_completion": max_completion or 4096,
+            "created": m.get("created", 0),
+            "supported_params": m.get("supported_parameters", []),
+            "description": m.get("description", ""),
+        })
+
+    if not free:
+        print("   ⚠ No free models matched filters, using fallback pool")
+        return None
+
+    # ── Rank by composite SkillForge Quality Score (SQS) ──
+    ranked = _rank_models(free)
+
+    # Cache
+    _MODEL_CACHE["models"] = ranked
+    _MODEL_CACHE["ts"] = time.time()
+
+    return ranked
+
+
+def _rank_models(models):
+    """
+    SkillForge Quality Score (SQS) — industry-standard composite metric.
+
+    Components (weighted):
+      1. Context Length Score  (25%) — longer = can ingest bigger papers
+      2. Completion Cap Score  (25%) — higher = can output full 400+ line skill files
+      3. Capability Score      (20%) — json_mode, tool use, system prompt support
+      4. Recency Score          (15%) — newer models extract better
+      5. Parameter Scale Score  (15%) — larger models inferred from name
+
+    Each sub-score is normalized to [0, 1]. Final SQS = weighted sum × 100.
+    """
+    if not models:
+        return []
+
+    now = time.time()
+
+    # Pre-compute max values for normalization
+    max_ctx = max(m["context_length"] for m in models)
+    max_comp = max(m["max_completion"] for m in models)
+    max_created = max(m["created"] for m in models) if any(m["created"] for m in models) else now
+    min_created = min(m["created"] for m in models if m["created"] > 0) if any(m["created"] > 0 for m in models) else now - 86400 * 365
+
+    scored = []
+    for m in models:
+        # 1. Context Length Score (25%)
+        ctx_score = min(m["context_length"] / max(max_ctx, 1), 1.0) if max_ctx > 0 else 0.5
+
+        # 2. Completion Cap Score (25%)
+        comp_score = min(m["max_completion"] / max(max_comp, 1), 1.0) if max_comp > 0 else 0.5
+
+        # 3. Capability Score (20%) — check for useful params
+        valuable_params = {"json_object", "response_format", "tools", "tool_choice",
+                           "temperature", "top_p", "max_tokens", "system"}
+        supported = set(m.get("supported_params", []))
+        cap_score = len(supported & valuable_params) / len(valuable_params)
+
+        # 4. Recency Score (15%) — newer is better
+        if m["created"] > 0 and max_created > min_created:
+            rec_score = (m["created"] - min_created) / (max_created - min_created)
+        else:
+            rec_score = 0.5
+
+        # 5. Parameter Scale Score (15%) — infer size from model name/ID
+        scale_score = _infer_param_scale(m["id"], m["name"])
+
+        # Weighted composite
+        sqs = (
+            0.25 * ctx_score +
+            0.25 * comp_score +
+            0.20 * cap_score +
+            0.15 * rec_score +
+            0.15 * scale_score
+        ) * 100
+
+        scored.append({**m, "sqs": round(sqs, 1),
+                       "_scores": {
+                           "ctx": round(ctx_score, 2), "comp": round(comp_score, 2),
+                           "cap": round(cap_score, 2), "rec": round(rec_score, 2),
+                           "scale": round(scale_score, 2),
+                       }})
+
+    # Sort descending by SQS
+    scored.sort(key=lambda x: x["sqs"], reverse=True)
+    return scored
+
+
+def _infer_param_scale(model_id, name):
+    """Infer relative model size from ID/name. Returns [0, 1]."""
+    text = f"{model_id} {name}".lower()
+
+    # Extract numbers that look like parameter counts
+    # Patterns: 405b, 70b, 27b, 8b, 3b, etc.
+    matches = re.findall(r'(\d+\.?\d*)\s*b(?:illion)?', text)
+    if matches:
+        largest = max(float(m) for m in matches)
+        # Normalize: 1B=0.1, 7B=0.3, 70B=0.7, 405B=0.95, 1000B+=1.0
+        return min(largest / 500, 1.0)
+
+    # MoE models often list active/total: "235b-a22b"
+    moe = re.findall(r'(\d+)b.*?a(\d+)b', text)
+    if moe:
+        total = float(moe[0][0])
+        return min(total / 500, 1.0)
+
+    # Known large models without explicit size
+    if any(k in text for k in ["gpt-4", "gemini-2.5-pro", "claude-3.5"]):
+        return 0.85
+    if any(k in text for k in ["gemini-2.5-flash", "deepseek-v3", "deepseek-chat-v3"]):
+        return 0.75
+    if any(k in text for k in ["llama-4", "qwen3"]):
+        return 0.70
+
+    return 0.4  # unknown → assume mid-tier
+
+
+def _print_model_rankings(models, top_n=8):
+    """Print ranked model table to terminal."""
+    show = models[:top_n]
+    max_name = min(max(len(m["id"].split("/")[-1]) for m in show), 35)
+
+    print(f"   ┌─{'─'*3}─┬─{'─'*max_name}─┬─{'─'*5}─┬─{'─'*8}─┬─{'─'*8}─┬─{'─'*4}─┐")
+    print(f"   │ {'#':>3} │ {'Model':<{max_name}} │ {'SQS':>5} │ {'Context':>8} │ {'MaxComp':>8} │ {'Rec':>4} │")
+    print(f"   ├─{'─'*3}─┼─{'─'*max_name}─┼─{'─'*5}─┼─{'─'*8}─┼─{'─'*8}─┼─{'─'*4}─┤")
+
+    for i, m in enumerate(show):
+        short = m["id"].split("/")[-1][:max_name]
+        ctx_k = f"{m['context_length']//1000}K"
+        comp_k = f"{m['max_completion']//1000}K"
+        rec = m["_scores"]["rec"]
+        marker = " ◄" if i == 0 else ""
+        print(f"   │ {i+1:>3} │ {short:<{max_name}} │ {m['sqs']:>5} │ {ctx_k:>8} │ {comp_k:>8} │ {rec:>4} │{marker}")
+
+    print(f"   └─{'─'*3}─┴─{'─'*max_name}─┴─{'─'*5}─┴─{'─'*8}─┴─{'─'*8}─┴─{'─'*4}─┘")
+
+    if len(models) > top_n:
+        print(f"   … +{len(models)-top_n} more models in fallback pool")
+
+
+def _build_model_pool(api_key, user_model=None):
+    """Discover, rank, and return ordered model ID list."""
+    ranked = _discover_free_models(api_key)
+
+    if ranked:
+        print(f"   ✓ Found {len(ranked)} free models, ranked by SQS:")
+        _print_model_rankings(ranked)
+        pool = [m["id"] for m in ranked]
+    else:
+        print(f"   ⚠ Using hardcoded fallback pool ({len(OPENROUTER_FALLBACK_MODELS)} models)")
+        pool = list(OPENROUTER_FALLBACK_MODELS)
+
+    # If user specified a model, put it first
+    if user_model:
+        pool = [user_model] + [m for m in pool if m != user_model]
+
+    return pool
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LLM PROVIDER — v4: openrouter + agentic model rotation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class LLMProvider:
@@ -105,32 +344,135 @@ class LLMProvider:
             genai.configure(api_key=self.api_key)
             self.model = model or "gemini-2.5-pro"
             self._genai = genai
+        elif provider == "openrouter":
+            openai = _require_openai()
+            self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+            if not self.api_key: print("❌ Set OPENROUTER_API_KEY"); sys.exit(1)
+            self.client = openai.OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.api_key,
+            )
+            # Live discovery + ranking
+            self._model_pool = _build_model_pool(self.api_key, model)
+            self._exhausted = set()
+            self._current_idx = 0
+            self.model = self._model_pool[0]
+            self._call_count = 0
+            self._rotations = 0
+            _or_banner(self.model, len(self._model_pool))
         else:
             print(f"❌ Unknown provider: {provider}"); sys.exit(1)
 
-    def generate(self, system_prompt, user_message, max_tokens=16000):
-        """Generate with retry on rate limits and graceful safety filter handling."""
-        for attempt in range(3):
+    # ── OpenRouter model rotation ──
+
+    def _rotate_model(self, failed_model, reason="rate_limit"):
+        """Rotate to next available free model. Returns True if rotation succeeded."""
+        self._exhausted.add(failed_model)
+        available = [m for m in self._model_pool if m not in self._exhausted]
+        if not available:
+            print(f"   {'─'*50}")
+            print(f"   ❌ All {len(self._model_pool)} models exhausted. No fallbacks left.")
+            print(f"   💡 Wait 60s for rate limits to reset, or use --provider anthropic")
+            print(f"   {'─'*50}")
+            return False
+        old_short = failed_model.split("/")[-1][:30]
+        self.model = available[0]
+        self._current_idx = self._model_pool.index(self.model)
+        self._rotations += 1
+        new_short = self.model.split("/")[-1][:30]
+        remaining = len(available) - 1
+        # Look up SQS if available from cache
+        sqs_str = ""
+        if _MODEL_CACHE["models"]:
+            for cm in _MODEL_CACHE["models"]:
+                if cm["id"] == self.model:
+                    sqs_str = f" (SQS: {cm['sqs']})"
+                    break
+        # Elegant terminal output
+        print(f"   {'─'*50}")
+        print(f"   🔄 Model rotation #{self._rotations}")
+        print(f"   ├─ ✗ {old_short} → {reason}")
+        print(f"   ├─ ✓ {new_short}{sqs_str}")
+        print(f"   └─ {remaining} fallback{'s' if remaining != 1 else ''} remaining")
+        print(f"   {'─'*50}")
+        return True
+
+    def _is_rate_limit(self, error):
+        """Detect rate limit errors across providers."""
+        s = str(error).lower()
+        return any(k in s for k in [
+            "429", "rate_limit", "rate limit", "resource_exhausted",
+            "quota", "too many requests", "requests per minute",
+            "capacity", "overloaded", "try again",
+        ])
+
+    def _is_permission_error(self, error):
+        s = str(error).lower()
+        return any(k in s for k in ["403", "permission_denied", "denied access", "forbidden"])
+
+    def _is_context_length_error(self, error):
+        s = str(error).lower()
+        return any(k in s for k in ["context_length", "too long", "maximum context", "token limit"])
+
+    # ── Main generate with rotation ──
+
+    def generate(self, system_prompt, user_message, max_tokens=16000, json_mode=False):
+        """Generate with retry, model rotation on rate limits, and safety filter handling."""
+        max_attempts = len(self._model_pool) + 2 if self.provider == "openrouter" else 3
+
+        for attempt in range(max_attempts):
             try:
-                return self._generate_inner(system_prompt, user_message, max_tokens)
+                result = self._generate_inner(system_prompt, user_message, max_tokens, json_mode)
+                if self.provider == "openrouter":
+                    self._call_count += 1
+                return result
             except Exception as e:
                 err_str = str(e).lower()
-                # Rate limit — retry with backoff
-                if "429" in str(e) or "resource_exhausted" in err_str or "quota" in err_str:
+
+                # ── OpenRouter: rotate on rate limit ──
+                if self.provider == "openrouter" and self._is_rate_limit(e):
+                    if self._rotate_model(self.model, "rate_limit"):
+                        continue
+                    else:
+                        # All exhausted — wait and reset
+                        print(f"   ⏳ All models exhausted. Waiting 60s for reset…")
+                        time.sleep(60)
+                        self._exhausted.clear()
+                        self.model = self._model_pool[0]
+                        print(f"   🔄 Pool reset. Retrying with {self.model.split('/')[-1][:30]}")
+                        continue
+
+                # ── OpenRouter: rotate on permission denied ──
+                if self.provider == "openrouter" and self._is_permission_error(e):
+                    if self._rotate_model(self.model, "permission_denied"):
+                        continue
+                    return ""
+
+                # ── OpenRouter: rotate on context length ──
+                if self.provider == "openrouter" and self._is_context_length_error(e):
+                    if self._rotate_model(self.model, "context_too_long"):
+                        continue
+                    return ""
+
+                # ── Non-OpenRouter rate limit ──
+                if self._is_rate_limit(e):
                     wait = (attempt + 1) * 30
                     print(f"   ⏳ Rate limited, waiting {wait}s (attempt {attempt+1}/3)…")
                     time.sleep(wait)
                     continue
-                # Gemini safety filter (finish_reason 2)
+
+                # ── Safety filter ──
                 if "finish_reason" in err_str or "valid `part`" in err_str:
                     print(f"   ⚠ Safety filter triggered, returning empty")
                     return ""
-                # Other errors — don't retry
+
+                # ── Unknown error ──
                 raise
+
         print("   ❌ Max retries exceeded")
         return ""
 
-    def _generate_inner(self, system_prompt, user_message, max_tokens):
+    def _generate_inner(self, system_prompt, user_message, max_tokens, json_mode=False):
         if self.provider == "anthropic":
             msg = self.client.messages.create(
                 model=self.model, max_tokens=max_tokens,
@@ -142,12 +484,23 @@ class LLMProvider:
 
         elif self.provider == "gemini":
             gm = self._genai.GenerativeModel(self.model, system_instruction=system_prompt)
-            resp = gm.generate_content(
-                user_message,
-                generation_config=self._genai.types.GenerationConfig(
-                    max_output_tokens=max_tokens, temperature=0.2,
-                ),
-            )
+            # Build generation config
+            gen_config = {"max_output_tokens": max_tokens, "temperature": 0.2}
+            # json_mode: force JSON output + disable thinking (fixes 0/10 validation on 2.5 models)
+            if json_mode:
+                gen_config["response_mime_type"] = "application/json"
+            try:
+                resp = gm.generate_content(
+                    user_message,
+                    generation_config=self._genai.types.GenerationConfig(**gen_config),
+                )
+            except TypeError:
+                # Fallback if response_mime_type not supported in this package version
+                gen_config.pop("response_mime_type", None)
+                resp = gm.generate_content(
+                    user_message,
+                    generation_config=self._genai.types.GenerationConfig(**gen_config),
+                )
             # Check for safety block before accessing .text
             if not resp.candidates or not resp.candidates[0].content.parts:
                 fr = resp.candidates[0].finish_reason if resp.candidates else "unknown"
@@ -158,6 +511,30 @@ class LLMProvider:
                 print(f"   [{self.provider}] {resp.usage_metadata.prompt_token_count:,} in / {resp.usage_metadata.candidates_token_count:,} out")
             except: print(f"   [{self.provider}] {len(result)} chars")
             return result
+
+        elif self.provider == "openrouter":
+            model_short = self.model.split("/")[-1][:25]
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ]
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            resp = self.client.chat.completions.create(**kwargs)
+            text = resp.choices[0].message.content or ""
+            # Token logging
+            if resp.usage:
+                print(f"   [openrouter/{model_short}] {resp.usage.prompt_tokens:,} in / {resp.usage.completion_tokens:,} out")
+            else:
+                print(f"   [openrouter/{model_short}] {len(text)} chars")
+            return text
 
     def generate_multi_turn(self, system_prompt, messages, max_tokens=16000):
         if self.provider == "anthropic":
@@ -189,6 +566,59 @@ class LLMProvider:
                             return result or ""
                         raise
             return result or ""
+        elif self.provider == "openrouter":
+            # Build full conversation for OpenRouter
+            api_messages = [{"role": "system", "content": system_prompt}]
+            for m in messages:
+                api_messages.append({
+                    "role": m["role"] if m["role"] != "assistant" else "assistant",
+                    "content": m["content"],
+                })
+            model_short = self.model.split("/")[-1][:25]
+            # Use same rotation-aware generate path
+            for attempt in range(len(self._model_pool) + 2):
+                try:
+                    resp = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=api_messages,
+                        max_tokens=max_tokens,
+                        temperature=0.2,
+                    )
+                    text = resp.choices[0].message.content or ""
+                    if resp.usage:
+                        print(f"   [openrouter/{model_short}] {resp.usage.prompt_tokens:,} in / {resp.usage.completion_tokens:,} out")
+                    else:
+                        print(f"   [openrouter/{model_short}] {len(text)} chars")
+                    self._call_count += 1
+                    return text
+                except Exception as e:
+                    if self._is_rate_limit(e):
+                        if self._rotate_model(self.model, "rate_limit"):
+                            model_short = self.model.split("/")[-1][:25]
+                            continue
+                    raise
+            return ""
+
+
+def _or_banner(model, pool_size):
+    """Print OpenRouter startup banner with SQS."""
+    short = model.split("/")[-1][:35]
+    sqs = "—"
+    if _MODEL_CACHE["models"]:
+        for cm in _MODEL_CACHE["models"]:
+            if cm["id"] == model:
+                sqs = f"{cm['sqs']}/100"
+                break
+    source = "live API" if _MODEL_CACHE["models"] else "fallback"
+    print(f"   ┌{'─'*52}┐")
+    print(f"   │ {'🌐 OpenRouter — Agentic Model Routing':^50} │")
+    print(f"   ├{'─'*52}┤")
+    print(f"   │ {'Primary:':<12} {short:<38} │")
+    print(f"   │ {'SQS:':<12} {sqs:<38} │")
+    print(f"   │ {'Pool:':<12} {f'{pool_size} models ({source})':<38} │")
+    print(f"   │ {'Rotation:':<12} {'automatic on rate limit':<38} │")
+    print(f"   │ {'Cost:':<12} {'$0 (free tier models)':<38} │")
+    print(f"   └{'─'*52}┘")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -481,7 +911,7 @@ def agentic_quality_loop(skill_content, source_text, llm, max_retries=2):
 
 
 def validate_skill(skill_content, llm):
-    """v3: Truncate more aggressively + handle all Gemini errors."""
+    """v3.1: Use json_mode for Gemini, debug output, regex fallback."""
     print("   🔍 Validating…")
     # Send only first 8K chars to avoid safety filter
     excerpt = skill_content[:8000]
@@ -490,12 +920,24 @@ def validate_skill(skill_content, llm):
             "Respond with ONLY a JSON object. No fences. No explanation.",
             VALIDATION_PROMPT.format(skill_content=excerpt),
             max_tokens=1000,
+            json_mode=True,  # Forces JSON output on Gemini, skips thinking tokens
         )
         if not text:
             return {"score": 0, "gaps": ["Validation returned empty"], "is_production_ready": False}
+
+        # Try standard JSON parsing first
         parsed = parse_json_from_llm(text)
         if parsed and "score" in parsed:
             return parsed
+
+        # Fallback: regex extraction if JSON parsing failed
+        print(f"   ⚠ JSON parse failed, trying regex. Raw ({len(text)} chars): {text[:150]}")
+        score_match = re.search(r'"score"\s*:\s*(\d+)', text)
+        if score_match:
+            score = int(score_match.group(1))
+            gaps = re.findall(r'"([^"]{10,})"', text)  # Extract strings >10 chars as potential gaps
+            return {"score": score, "gaps": gaps[:5], "is_production_ready": score >= 7}
+
     except Exception as e:
         print(f"   Validation error: {e}")
     return {"score": 0, "gaps": ["Validation parse failed"], "is_production_ready": False}
@@ -992,6 +1434,7 @@ def main():
   %(prog)s --arxiv 2103.13630
   %(prog)s --pdf paper.pdf
   %(prog)s --arxiv 2103.13630 --provider gemini --model gemini-2.5-flash
+  %(prog)s --arxiv 2103.13630 --provider openrouter
   %(prog)s batch --list sources.txt
 """)
     sub = p.add_subparsers(dest="command")
@@ -1001,7 +1444,7 @@ def main():
 
     for pr in [p, bp]:
         pr.add_argument("--output","-o", default="./skills")
-        pr.add_argument("--provider", choices=["anthropic","gemini"], default="anthropic")
+        pr.add_argument("--provider", choices=["anthropic","gemini","openrouter"], default="anthropic")
         pr.add_argument("--model", default=None)
         pr.add_argument("--api-key", default=None)
         pr.add_argument("--domain", default=None)
