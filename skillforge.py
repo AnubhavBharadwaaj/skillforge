@@ -162,6 +162,18 @@ OPENROUTER_FALLBACK_MODELS = [
     "deepseek/deepseek-r1-0528:free",
 ]
 
+# Cheap paid models — fast, reliable, pennies per paper
+# Used with --paid flag or as auto-upgrade when free pool exhausts
+OPENROUTER_PAID_MODELS = [
+    # Model ID                              # Approx cost per paper
+    "google/gemini-2.5-flash",              # ~$0.01-0.03
+    "deepseek/deepseek-chat-v3-0324",       # ~$0.01-0.02
+    "google/gemini-2.5-pro",                # ~$0.05-0.10
+    "meta-llama/llama-4-maverick",          # ~$0.02-0.05
+    "anthropic/claude-sonnet-4-20250514",   # ~$0.10-0.20
+    "openai/gpt-4.1-mini",                  # ~$0.02-0.05
+]
+
 # Cache: avoid hitting /models every run
 _MODEL_CACHE = {"models": None, "ts": 0, "ttl": 3600}  # 1 hour TTL
 
@@ -313,23 +325,24 @@ def _discover_free_models(api_key):
 
 def _rank_models(models):
     """
-    SkillForge Quality Score (SQS) — industry-standard composite metric.
+    SkillForge Quality Score (SQS) — speed-prioritized for free tier.
 
     Components (weighted):
-      1. Context Length Score  (25%) — longer = can ingest bigger papers
-      2. Completion Cap Score  (25%) — higher = can output full 400+ line skill files
-      3. Capability Score      (20%) — json_mode, tool use, system prompt support
-      4. Recency Score          (15%) — newer models extract better
-      5. Parameter Scale Score  (15%) — larger models inferred from name
+      1. Speed Score           (30%) — smaller/faster models rank higher on free tier
+      2. Completion Cap Score  (20%) — must output full 400+ line skill files
+      3. Context Length Score  (15%) — must fit papers
+      4. Capability Score      (15%) — json_mode, system prompt support
+      5. Recency Score         (10%) — newer models extract better
+      6. Reputation Score      (10%) — known-good families boosted
 
-    Each sub-score is normalized to [0, 1]. Final SQS = weighted sum × 100.
+    On free tier, speed is king. A fast model that finishes in 30s beats a
+    slow model that takes 29 minutes but produces marginally better output.
     """
     if not models:
         return []
 
     now = time.time()
 
-    # Pre-compute max values for normalization
     max_ctx = max(m["context_length"] for m in models)
     max_comp = max(m["max_completion"] for m in models)
     max_created = max(m["created"] for m in models) if any(m["created"] for m in models) else now
@@ -337,75 +350,156 @@ def _rank_models(models):
 
     scored = []
     for m in models:
-        # 1. Context Length Score (25%)
-        ctx_score = min(m["context_length"] / max(max_ctx, 1), 1.0) if max_ctx > 0 else 0.5
+        # 1. Speed Score (30%) — fast models rank highest
+        speed_score = _estimate_speed(m["id"], m["name"])
 
-        # 2. Completion Cap Score (25%)
+        # 2. Completion Cap Score (20%)
         comp_score = min(m["max_completion"] / max(max_comp, 1), 1.0) if max_comp > 0 else 0.5
 
-        # 3. Capability Score (20%) — check for useful params
+        # 3. Context Length Score (15%)
+        ctx_score = min(m["context_length"] / max(max_ctx, 1), 1.0) if max_ctx > 0 else 0.5
+
+        # 4. Capability Score (15%)
         valuable_params = {"json_object", "response_format", "tools", "tool_choice",
                            "temperature", "top_p", "max_tokens", "system"}
         supported = set(m.get("supported_params", []))
         cap_score = len(supported & valuable_params) / len(valuable_params)
 
-        # 4. Recency Score (15%) — newer is better
+        # 5. Recency Score (10%)
         if m["created"] > 0 and max_created > min_created:
             rec_score = (m["created"] - min_created) / (max_created - min_created)
         else:
             rec_score = 0.5
 
-        # 5. Parameter Scale Score (15%) — infer size from model name/ID
-        scale_score = _infer_param_scale(m["id"], m["name"])
+        # 6. Reputation Score (10%) — known-good model families
+        rep_score = _reputation_score(m["id"], m["name"])
 
         # Weighted composite
         sqs = (
-            0.25 * ctx_score +
-            0.25 * comp_score +
-            0.20 * cap_score +
-            0.15 * rec_score +
-            0.15 * scale_score
+            0.30 * speed_score +
+            0.20 * comp_score +
+            0.15 * ctx_score +
+            0.15 * cap_score +
+            0.10 * rec_score +
+            0.10 * rep_score
         ) * 100
 
         scored.append({**m, "sqs": round(sqs, 1),
                        "_scores": {
-                           "ctx": round(ctx_score, 2), "comp": round(comp_score, 2),
-                           "cap": round(cap_score, 2), "rec": round(rec_score, 2),
-                           "scale": round(scale_score, 2),
+                           "spd": round(speed_score, 2), "comp": round(comp_score, 2),
+                           "ctx": round(ctx_score, 2), "cap": round(cap_score, 2),
+                           "rec": round(rec_score, 2), "rep": round(rep_score, 2),
                        }})
 
-    # Sort descending by SQS
     scored.sort(key=lambda x: x["sqs"], reverse=True)
     return scored
 
 
-def _infer_param_scale(model_id, name):
-    """Infer relative model size from ID/name. Returns [0, 1]."""
+def _estimate_speed(model_id, name):
+    """Estimate inference speed on free tier. Returns [0, 1]. Higher = faster.
+
+    On free tier, speed correlates inversely with model size and directly
+    with provider infrastructure. Known-fast models get high scores."""
     text = f"{model_id} {name}".lower()
 
-    # Extract numbers that look like parameter counts
-    # Patterns: 405b, 70b, 27b, 8b, 3b, etc.
-    matches = re.findall(r'(\d+\.?\d*)\s*b(?:illion)?', text)
-    if matches:
-        largest = max(float(m) for m in matches)
-        # Normalize: 1B=0.1, 7B=0.3, 70B=0.7, 405B=0.95, 1000B+=1.0
-        return min(largest / 500, 1.0)
+    # ── Tier 1: Known fast on free tier (0.85-1.0) ──
+    fast_patterns = {
+        "gemini-2.5-flash": 0.95,   # Google infra, flash = optimized for speed
+        "gemini-2.0-flash": 0.93,
+        "gemini-flash":     0.90,
+        "gemma-3-12b":      0.88,   # Small model, fast
+        "gemma-3-4b":       0.92,   # Very small, very fast
+        "gemma-4":          0.85,
+        "phi-4":            0.88,   # Small Microsoft model
+        "phi-3":            0.88,
+        "llama-4-scout":    0.82,   # Smaller llama variant
+        "mistral-small":    0.87,   # Optimized for speed
+    }
+    for pattern, score in fast_patterns.items():
+        if pattern in text:
+            return score
 
-    # MoE models often list active/total: "235b-a22b"
+    # ── Tier 2: Medium speed (0.55-0.80) ──
+    medium_patterns = {
+        "deepseek-chat-v3":   0.75,  # Good infra but large
+        "deepseek-chat":      0.72,
+        "llama-4-maverick":   0.70,  # Larger llama
+        "llama-3.3-70b":      0.65,
+        "qwen-2.5-72b":       0.60,
+        "gemma-3-27b":        0.68,
+        "gemini-2.5-pro":     0.65,  # Pro = larger, slower than flash
+        "glm-4":              0.60,
+    }
+    for pattern, score in medium_patterns.items():
+        if pattern in text:
+            return score
+
+    # ── Tier 3: Known slow on free tier (0.1-0.45) ──
+    slow_patterns = {
+        "minimax":           0.15,   # Empirically 29 min per chunk
+        "nemotron-120b":     0.20,   # Huge model, overloaded free
+        "nemotron":          0.30,
+        "qwen3-235b":        0.25,   # 235B params, crawls on free
+        "qwen3-coder":       0.35,   # Large coder model
+        "deepseek-r1":       0.30,   # Reasoning model = very slow
+        "hermes-3-llama-3.1-405b": 0.20,  # 405B = glacier
+        "405b":              0.15,
+    }
+    for pattern, score in slow_patterns.items():
+        if pattern in text:
+            return score
+
+    # ── Infer from parameter count ──
+    matches = re.findall(r'(\d+\.?\d*)\s*b', text)
+    if matches:
+        params_b = max(float(m) for m in matches)
+        # Inverse: smaller = faster. 3B=0.90, 12B=0.75, 70B=0.45, 405B=0.15
+        if params_b <= 3:    return 0.90
+        if params_b <= 12:   return 0.78
+        if params_b <= 30:   return 0.65
+        if params_b <= 80:   return 0.45
+        if params_b <= 200:  return 0.30
+        return 0.15
+
+    # MoE: use active params, not total
     moe = re.findall(r'(\d+)b.*?a(\d+)b', text)
     if moe:
-        total = float(moe[0][0])
-        return min(total / 500, 1.0)
+        active = float(moe[0][1])
+        if active <= 12:  return 0.80
+        if active <= 30:  return 0.65
+        return 0.45
 
-    # Known large models without explicit size
-    if any(k in text for k in ["gpt-4", "gemini-2.5-pro", "claude-3.5"]):
-        return 0.85
-    if any(k in text for k in ["gemini-2.5-flash", "deepseek-v3", "deepseek-chat-v3"]):
+    return 0.50  # unknown
+
+
+def _reputation_score(model_id, name):
+    """Score based on known extraction quality for SkillForge's use case.
+    Returns [0, 1]. Based on empirical results from real runs."""
+    text = f"{model_id} {name}".lower()
+
+    # Proven excellent for document extraction
+    excellent = ["gemini-2.5-flash", "gemini-2.5-pro", "deepseek-chat-v3",
+                 "claude", "gpt-4"]
+    if any(k in text for k in excellent):
+        return 0.95
+
+    # Known good
+    good = ["llama-4", "gemma-3-27b", "gemma-4", "qwen-2.5-72b",
+            "phi-4", "mistral-small"]
+    if any(k in text for k in good):
         return 0.75
-    if any(k in text for k in ["llama-4", "qwen3"]):
-        return 0.70
 
-    return 0.4  # unknown → assume mid-tier
+    # Known mediocre for extraction (good at code, bad at papers)
+    mediocre = ["qwen3-coder", "deepseek-r1", "deepseek-coder"]
+    if any(k in text for k in mediocre):
+        return 0.40
+
+    # Known problematic on free tier
+    bad = ["minimax", "nemotron", "hermes-3"]
+    if any(k in text for k in bad):
+        return 0.20
+
+    return 0.55  # unknown
 
 
 def _print_model_rankings(models, top_n=8):
@@ -413,19 +507,19 @@ def _print_model_rankings(models, top_n=8):
     show = models[:top_n]
     max_name = min(max(len(m["id"].split("/")[-1]) for m in show), 35)
 
-    print(f"   ┌─{'─'*3}─┬─{'─'*max_name}─┬─{'─'*5}─┬─{'─'*8}─┬─{'─'*8}─┬─{'─'*4}─┐")
-    print(f"   │ {'#':>3} │ {'Model':<{max_name}} │ {'SQS':>5} │ {'Context':>8} │ {'MaxComp':>8} │ {'Rec':>4} │")
-    print(f"   ├─{'─'*3}─┼─{'─'*max_name}─┼─{'─'*5}─┼─{'─'*8}─┼─{'─'*8}─┼─{'─'*4}─┤")
+    print(f"   ┌─{'─'*3}─┬─{'─'*max_name}─┬─{'─'*5}─┬─{'─'*8}─┬─{'─'*8}─┬─{'─'*5}─┐")
+    print(f"   │ {'#':>3} │ {'Model':<{max_name}} │ {'SQS':>5} │ {'Context':>8} │ {'MaxComp':>8} │ {'Speed':>5} │")
+    print(f"   ├─{'─'*3}─┼─{'─'*max_name}─┼─{'─'*5}─┼─{'─'*8}─┼─{'─'*8}─┼─{'─'*5}─┤")
 
     for i, m in enumerate(show):
         short = m["id"].split("/")[-1][:max_name]
         ctx_k = f"{m['context_length']//1000}K"
         comp_k = f"{m['max_completion']//1000}K"
-        rec = m["_scores"]["rec"]
+        spd = m["_scores"]["spd"]
         marker = " ◄" if i == 0 else ""
-        print(f"   │ {i+1:>3} │ {short:<{max_name}} │ {m['sqs']:>5} │ {ctx_k:>8} │ {comp_k:>8} │ {rec:>4} │{marker}")
+        print(f"   │ {i+1:>3} │ {short:<{max_name}} │ {m['sqs']:>5} │ {ctx_k:>8} │ {comp_k:>8} │ {spd:>5} │{marker}")
 
-    print(f"   └─{'─'*3}─┴─{'─'*max_name}─┴─{'─'*5}─┴─{'─'*8}─┴─{'─'*8}─┴─{'─'*4}─┘")
+    print(f"   └─{'─'*3}─┴─{'─'*max_name}─┴─{'─'*5}─┴─{'─'*8}─┴─{'─'*8}─┴─{'─'*5}─┘")
 
     if len(models) > top_n:
         print(f"   … +{len(models)-top_n} more models in fallback pool")
@@ -455,8 +549,9 @@ def _build_model_pool(api_key, user_model=None):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class LLMProvider:
-    def __init__(self, provider="anthropic", model=None, api_key=None):
+    def __init__(self, provider="anthropic", model=None, api_key=None, paid=False):
         self.provider = provider
+        self._paid = paid  # OpenRouter: use paid models
         if provider == "anthropic":
             mod = _require_anthropic()
             self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -478,29 +573,53 @@ class LLMProvider:
                 base_url="https://openrouter.ai/api/v1",
                 api_key=self.api_key,
             )
-            # Live discovery + ranking
-            self._model_pool = _build_model_pool(self.api_key, model)
+            # Build model pool
+            if paid:
+                # Paid mode: use cheap paid models directly
+                self._model_pool = list(OPENROUTER_PAID_MODELS)
+                if model:
+                    self._model_pool = [model] + [m for m in self._model_pool if m != model]
+                self._free_exhausted = True  # skip free tier
+            else:
+                # Free mode: discover + rank free models, paid as fallback
+                self._model_pool = _build_model_pool(self.api_key, model)
+                self._free_exhausted = False
             self._exhausted = set()
             self._current_idx = 0
             self.model = self._model_pool[0]
             self._call_count = 0
             self._rotations = 0
-            _or_banner(self.model, len(self._model_pool))
+            _or_banner(self.model, len(self._model_pool), paid)
         else:
             print(f"❌ Unknown provider: {provider}"); sys.exit(1)
 
     # ── OpenRouter model rotation ──
 
     def _rotate_model(self, failed_model, reason="rate_limit"):
-        """Rotate to next available free model. Returns True if rotation succeeded."""
+        """Rotate to next available model. Auto-upgrades to paid if free pool exhausts."""
         self._exhausted.add(failed_model)
         available = [m for m in self._model_pool if m not in self._exhausted]
+
+        # If free pool exhausted, auto-upgrade to paid
+        if not available and not self._free_exhausted and not self._paid:
+            self._free_exhausted = True
+            print(f"   {'─'*50}")
+            print(f"   💰 Free pool exhausted — upgrading to paid models")
+            print(f"   ├─ Adding {len(OPENROUTER_PAID_MODELS)} cheap paid models")
+            print(f"   └─ Estimated cost: $0.01-0.10 per paper")
+            print(f"   {'─'*50}")
+            for pm in OPENROUTER_PAID_MODELS:
+                if pm not in self._model_pool:
+                    self._model_pool.append(pm)
+            available = [m for m in self._model_pool if m not in self._exhausted]
+
         if not available:
             print(f"   {'─'*50}")
-            print(f"   ❌ All {len(self._model_pool)} models exhausted. No fallbacks left.")
+            print(f"   ❌ All {len(self._model_pool)} models exhausted (free + paid).")
             print(f"   💡 Wait 60s for rate limits to reset, or use --provider anthropic")
             print(f"   {'─'*50}")
             return False
+
         old_short = failed_model.split("/")[-1][:30]
         self.model = available[0]
         self._current_idx = self._model_pool.index(self.model)
@@ -514,22 +633,26 @@ class LLMProvider:
                 if cm["id"] == self.model:
                     sqs_str = f" (SQS: {cm['sqs']})"
                     break
+        # Check if this is a paid model
+        is_paid = self.model in OPENROUTER_PAID_MODELS or ":free" not in self.model
+        tier = " 💰" if is_paid else ""
         # Elegant terminal output
         print(f"   {'─'*50}")
         print(f"   🔄 Model rotation #{self._rotations}")
         print(f"   ├─ ✗ {old_short} → {reason}")
-        print(f"   ├─ ✓ {new_short}{sqs_str}")
+        print(f"   ├─ ✓ {new_short}{sqs_str}{tier}")
         print(f"   └─ {remaining} fallback{'s' if remaining != 1 else ''} remaining")
         print(f"   {'─'*50}")
         return True
 
     def _is_rate_limit(self, error):
-        """Detect rate limit errors across providers."""
+        """Detect rate limit and spend limit errors across providers."""
         s = str(error).lower()
         return any(k in s for k in [
-            "429", "rate_limit", "rate limit", "resource_exhausted",
+            "429", "402", "rate_limit", "rate limit", "resource_exhausted",
             "quota", "too many requests", "requests per minute",
             "capacity", "overloaded", "try again",
+            "spend limit", "spending limit", "balance",
         ])
 
     def _is_permission_error(self, error):
@@ -745,7 +868,7 @@ class LLMProvider:
             return ""
 
 
-def _or_banner(model, pool_size):
+def _or_banner(model, pool_size, paid=False):
     """Print OpenRouter startup banner with SQS."""
     short = model.split("/")[-1][:35]
     sqs = "—"
@@ -755,14 +878,17 @@ def _or_banner(model, pool_size):
                 sqs = f"{cm['sqs']}/100"
                 break
     source = "live API" if _MODEL_CACHE["models"] else "fallback"
+    mode = "paid (fast)" if paid else "free → paid fallback"
+    cost = "~$0.01-0.10/paper" if paid else "$0 (auto-upgrades if needed)"
     print(f"   ┌{'─'*52}┐")
     print(f"   │ {'🌐 OpenRouter — Agentic Model Routing':^50} │")
     print(f"   ├{'─'*52}┤")
     print(f"   │ {'Primary:':<12} {short:<38} │")
     print(f"   │ {'SQS:':<12} {sqs:<38} │")
     print(f"   │ {'Pool:':<12} {f'{pool_size} models ({source})':<38} │")
+    print(f"   │ {'Mode:':<12} {mode:<38} │")
     print(f"   │ {'Rotation:':<12} {'automatic on rate limit':<38} │")
-    print(f"   │ {'Cost:':<12} {'$0 (free tier models)':<38} │")
+    print(f"   │ {'Cost:':<12} {cost:<38} │")
     print(f"   └{'─'*52}┘")
 
 
@@ -987,9 +1113,9 @@ def get_domain_context(d):
 # AGENTIC QUALITY LOOP — v3 core addition
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def agentic_quality_loop(skill_content, source_text, llm, max_retries=2):
+def agentic_quality_loop(skill_content, source_text, llm, max_retries=2, quality_target=7):
     """
-    Validate → if score < 7, fix gaps → re-validate → repeat.
+    Validate → if score < target, fix gaps → re-validate → repeat.
     This is what makes SkillForge agentic: observe, reason, act, loop.
     """
     best_content = skill_content
@@ -1002,12 +1128,12 @@ def agentic_quality_loop(skill_content, source_text, llm, max_retries=2):
         gaps = validation.get("gaps", [])
 
         if attempt == 0:
-            print(f"🔍 Initial quality: {score}/10")
+            print(f"🔍 Initial quality: {score}/10 (target: {quality_target}/10)")
         else:
             print(f"🔍 Retry {attempt} quality: {score}/10")
 
-        if score >= 7:
-            print(f"   ✓ Quality target met ({score}/10)")
+        if score >= quality_target:
+            print(f"   ✓ Quality target met ({score}/{quality_target})")
             return best_content, validation
 
         if score > best_score:
@@ -1303,7 +1429,7 @@ def trim_budget(dump, budget):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def github_pipeline(url, llm, output_dir, max_file_kb=200,
-                    token_budget=150000, domain=None, skip_val=False):
+                    token_budget=150000, domain=None, skip_val=False, quality_target=7):
     meta = extract_repo_meta(url)
     tmpdir = tempfile.mkdtemp(prefix="sf_")
     clone_dest = os.path.join(tmpdir, meta["repo"])
@@ -1346,7 +1472,7 @@ def github_pipeline(url, llm, output_dir, max_file_kb=200,
         # ── AGENTIC LOOP ──
         if not skip_val:
             skill_content, validation = agentic_quality_loop(
-                skill_content, trimmed[:35000], llm, max_retries=2
+                skill_content, trimmed[:35000], llm, max_retries=2, quality_target=quality_target
             )
         else:
             validation = None
@@ -1429,7 +1555,7 @@ def chunk_text(text, max_c=50000):
     return chunks
 
 
-def pdf_pipeline(pdf_path, llm, output_dir, domain=None, max_pages=40, skip_val=False):
+def pdf_pipeline(pdf_path, llm, output_dir, domain=None, max_pages=40, skip_val=False, quality_target=7):
     paper_text = extract_pdf(pdf_path, max_pages)
 
     if llm is None:
@@ -1492,7 +1618,7 @@ def pdf_pipeline(pdf_path, llm, output_dir, domain=None, max_pages=40, skip_val=
     # ── AGENTIC LOOP ──
     if not skip_val:
         skill_content, validation = agentic_quality_loop(
-            skill_content, paper_text[:35000], llm, max_retries=2
+            skill_content, paper_text[:35000], llm, max_retries=2, quality_target=quality_target
         )
     else:
         validation = None
@@ -1550,22 +1676,84 @@ def detect_type(src):
     return "unknown"
 
 
+VERIFY_PROMPT = """You are a fact-checker for technical skill files. Given a skill file,
+verify that:
+1. All equations are mathematically correct (no missing terms, wrong operators)
+2. All tables have consistent rows/columns and plausible numbers
+3. All hyperparameter values are realistic (learning rates, batch sizes, temperatures)
+4. No hallucinated paper titles, author names, or benchmark numbers
+
+Respond with ONLY a JSON object:
+{
+  "verified": true/false,
+  "issues_found": 0,
+  "issues": ["description of each issue"],
+  "confidence": 0.0-1.0
+}
+
+SKILL FILE:
+{skill_content}
+"""
+
+
+def _verify_skill(skill_path, llm):
+    """Post-generation verification pass: re-check equations, tables, numbers."""
+    print(f"\n🔬 Verification pass on {Path(skill_path).name}…")
+    content = Path(skill_path).read_text()
+
+    # Only send first 12K to avoid context issues on free tier
+    excerpt = content[:12000]
+
+    with Spinner("Verifying equations and tables"):
+        result = llm.generate(
+            "Respond with ONLY a JSON object. No fences. No explanation.",
+            VERIFY_PROMPT.format(skill_content=excerpt),
+            max_tokens=2000,
+            json_mode=True,
+        )
+
+    if not result:
+        print("   ⚠ Verification returned empty, skipping")
+        return
+
+    parsed = parse_json_from_llm(result)
+    if not parsed:
+        print("   ⚠ Could not parse verification result")
+        return
+
+    verified = parsed.get("verified", False)
+    issues = parsed.get("issues", [])
+    confidence = parsed.get("confidence", 0)
+
+    if verified:
+        print(f"   ✅ Verified (confidence: {confidence:.0%})")
+    else:
+        print(f"   ⚠ Found {len(issues)} issue(s) (confidence: {confidence:.0%}):")
+        for issue in issues[:5]:
+            print(f"      ├─ {issue}")
+        print(f"   💡 Review the skill file manually for these items")
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CLI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def process_one(src, llm, args):
     t = detect_type(src)
+    qt = getattr(args, 'quality', 7)
     if t == "github":
         return github_pipeline(src, llm, args.output, args.max_file_kb,
-                               args.token_budget, args.domain, args.skip_validation)
+                               args.token_budget, args.domain, args.skip_validation,
+                               quality_target=qt)
     elif t == "arxiv":
         pdf = download_arxiv(src)
         return pdf_pipeline(pdf, llm, args.output, args.domain,
-                            args.max_pages, args.skip_validation)
+                            args.max_pages, args.skip_validation,
+                            quality_target=qt)
     elif t == "pdf":
         return pdf_pipeline(src, llm, args.output, args.domain,
-                            args.max_pages, args.skip_validation)
+                            args.max_pages, args.skip_validation,
+                            quality_target=qt)
     else:
         print(f"❌ Unknown source: {src}"); return None
 
@@ -1576,10 +1764,10 @@ def main():
         epilog="""Examples:
   %(prog)s --github https://github.com/owner/repo
   %(prog)s --arxiv 2103.13630
-  %(prog)s --pdf paper.pdf
-  %(prog)s --arxiv 2103.13630 --provider gemini --model gemini-2.5-flash
   %(prog)s --arxiv 2103.13630 --provider openrouter
-  %(prog)s batch --list sources.txt
+  %(prog)s --arxiv 2103.13630 --provider openrouter --paid
+  %(prog)s --arxiv 2103.13630 --provider openrouter --paid --quality 9 --verify
+  %(prog)s batch --list sources.txt --provider openrouter
 """)
     sub = p.add_subparsers(dest="command")
     bp = sub.add_parser("batch", help="Batch process from file")
@@ -1597,23 +1785,43 @@ def main():
         pr.add_argument("--token-budget", type=int, default=150000)
         pr.add_argument("--skip-validation", action="store_true")
         pr.add_argument("--no-llm", action="store_true")
+        pr.add_argument("--paid", action="store_true",
+                        help="Use cheap paid models via OpenRouter (~$0.01-0.10/paper)")
+        pr.add_argument("--quality", type=int, default=7, metavar="N",
+                        help="Quality target 1-10 (default: 7, use 9-10 with --paid)")
+        pr.add_argument("--verify", action="store_true",
+                        help="Run extra verification pass: re-check all equations and tables")
 
     p.add_argument("--github", help="GitHub URL")
     p.add_argument("--arxiv", help="arXiv ID or URL")
     p.add_argument("--pdf", help="Local PDF path")
 
     args = p.parse_args()
-    llm = None if args.no_llm else LLMProvider(args.provider, args.model, args.api_key)
+
+    # Validate quality range
+    if args.quality < 1 or args.quality > 10:
+        print("❌ --quality must be 1-10"); sys.exit(1)
+    if args.quality > 7 and not args.paid and args.provider == "openrouter":
+        print("⚠ Quality target >7 on free tier may require many retries. Consider --paid.")
+
+    llm = None if args.no_llm else LLMProvider(args.provider, args.model, args.api_key, paid=args.paid)
+
+    # Verification pass setup
+    verify = getattr(args, 'verify', False)
+    qt = args.quality
 
     if args.command == "batch":
         with open(args.list) as f:
             srcs = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        print(f"\n{'═'*60}\n  SkillForge v3 Batch — {len(srcs)} sources\n{'═'*60}")
+        print(f"\n{'═'*60}\n  SkillForge v4 Batch — {len(srcs)} sources\n{'═'*60}")
+        if qt != 7: print(f"  Quality target: {qt}/10")
         results = []
         for i, src in enumerate(srcs):
             print(f"\n{'━'*50}\n  [{i+1}/{len(srcs)}] {src}\n{'━'*50}")
             try:
                 out = process_one(src, llm, args)
+                if verify and out and llm:
+                    _verify_skill(out, llm)
                 results.append({"source":src,"output":out,"status":"ok"})
             except Exception as e:
                 print(f"❌ {e}")
@@ -1625,14 +1833,23 @@ def main():
             print(f"  {'✓' if r['status']=='ok' else '✗'} {r['source']}")
 
     elif args.github:
-        github_pipeline(args.github, llm, args.output, args.max_file_kb,
-                        args.token_budget, args.domain, args.skip_validation)
+        out = github_pipeline(args.github, llm, args.output, args.max_file_kb,
+                        args.token_budget, args.domain, args.skip_validation,
+                        quality_target=qt)
+        if verify and out and llm:
+            _verify_skill(out, llm)
     elif args.arxiv:
         pdf = download_arxiv(args.arxiv)
-        pdf_pipeline(pdf, llm, args.output, args.domain, args.max_pages, args.skip_validation)
+        out = pdf_pipeline(pdf, llm, args.output, args.domain, args.max_pages,
+                     args.skip_validation, quality_target=qt)
+        if verify and out and llm:
+            _verify_skill(out, llm)
     elif args.pdf:
         if not os.path.exists(args.pdf): print(f"❌ Not found: {args.pdf}"); sys.exit(1)
-        pdf_pipeline(args.pdf, llm, args.output, args.domain, args.max_pages, args.skip_validation)
+        out = pdf_pipeline(args.pdf, llm, args.output, args.domain, args.max_pages,
+                     args.skip_validation, quality_target=qt)
+        if verify and out and llm:
+            _verify_skill(out, llm)
     else:
         p.print_help(); sys.exit(1)
 
