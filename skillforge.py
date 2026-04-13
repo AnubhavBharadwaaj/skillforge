@@ -174,6 +174,19 @@ OPENROUTER_PAID_MODELS = [
     "openai/gpt-4.1-mini",                  # ~$0.02-0.05
 ]
 
+# Quality escalation chain — sorted by extraction quality (strongest last)
+# Used when paid mode can't hit quality target with current model
+QUALITY_ESCALATION_CHAIN = [
+    # Model                                 # Quality  # Cost/paper  # When to use
+    "google/gemini-2.5-flash",              # Good      $0.01-0.03   Default paid
+    "deepseek/deepseek-chat-v3-0324",       # Good      $0.01-0.02   First escalation
+    "google/gemini-2.5-pro",                # Great     $0.05-0.10   Second escalation
+    "openai/gpt-4.1-mini",                  # Great     $0.02-0.05   Third escalation
+    "anthropic/claude-sonnet-4-20250514",   # Excellent $0.10-0.20   Fourth escalation
+    "openai/gpt-4.1",                       # Top-tier  $0.20-0.50   Nuclear option
+    "anthropic/claude-opus-4-20250514",     # Best      $0.50-1.00   Final boss
+]
+
 # Cache: avoid hitting /models every run
 _MODEL_CACHE = {"models": None, "ts": 0, "ttl": 3600}  # 1 hour TTL
 
@@ -663,6 +676,51 @@ class LLMProvider:
         s = str(error).lower()
         return any(k in s for k in ["context_length", "too long", "maximum context", "token limit"])
 
+    def escalate_for_quality(self, current_score, target_score):
+        """Escalate to a stronger model when quality target isn't met.
+        Only works in paid openrouter mode. Returns True if escalation happened."""
+        if self.provider != "openrouter" or not self._paid:
+            return False
+
+        # Find current model's position in escalation chain
+        current = self.model
+        chain = QUALITY_ESCALATION_CHAIN
+
+        # Find next stronger model
+        current_idx = -1
+        for i, m in enumerate(chain):
+            if m == current:
+                current_idx = i
+                break
+
+        # If current model isn't in chain, start from after the first one
+        if current_idx == -1:
+            current_idx = 0
+
+        # Try next model in chain
+        next_idx = current_idx + 1
+        if next_idx >= len(chain):
+            print(f"   {'─'*50}")
+            print(f"   ❌ Already on strongest model ({current.split('/')[-1]})")
+            print(f"   └─ Score {current_score}/10 is the best achievable")
+            print(f"   {'─'*50}")
+            return False
+
+        old_short = current.split("/")[-1][:30]
+        new_model = chain[next_idx]
+        new_short = new_model.split("/")[-1][:30]
+        remaining = len(chain) - next_idx - 1
+
+        print(f"   {'─'*50}")
+        print(f"   ⬆ Quality escalation ({current_score}/{target_score} not met)")
+        print(f"   ├─ ✗ {old_short} → scored {current_score}/10")
+        print(f"   ├─ ✓ {new_short} (stronger model)")
+        print(f"   └─ {remaining} escalation{'s' if remaining != 1 else ''} remaining")
+        print(f"   {'─'*50}")
+
+        self.model = new_model
+        return True
+
     # ── Main generate with rotation ──
 
     def generate(self, system_prompt, user_message, max_tokens=16000, json_mode=False):
@@ -1116,68 +1174,143 @@ def get_domain_context(d):
 def agentic_quality_loop(skill_content, source_text, llm, max_retries=2, quality_target=7):
     """
     Validate → if score < target, fix gaps → re-validate → repeat.
-    This is what makes SkillForge agentic: observe, reason, act, loop.
+    On paid mode: if retries exhaust, escalate to stronger model and retry.
+    This is what makes SkillForge agentic: observe, reason, act, escalate, loop.
     """
     best_content = skill_content
     best_score = 0
+    best_validation = None
+    escalations = 0
+    max_escalations = len(QUALITY_ESCALATION_CHAIN) - 1  # don't count current
 
-    for attempt in range(max_retries + 1):
-        # ── Observe: validate current output ──
-        validation = validate_skill(best_content, llm)
-        score = validation.get("score", 0)
-        gaps = validation.get("gaps", [])
+    while True:
+        # ── Inner loop: retry with current model ──
+        for attempt in range(max_retries + 1):
+            validation = validate_skill(best_content, llm)
+            score = validation.get("score", 0)
+            gaps = validation.get("gaps", [])
 
-        if attempt == 0:
-            print(f"🔍 Initial quality: {score}/10 (target: {quality_target}/10)")
-        else:
-            print(f"🔍 Retry {attempt} quality: {score}/10")
+            if attempt == 0 and escalations == 0:
+                print(f"🔍 Initial quality: {score}/10 (target: {quality_target}/10)")
+            elif escalations > 0 and attempt == 0:
+                model_short = llm.model.split("/")[-1][:25] if hasattr(llm, 'model') else "?"
+                print(f"🔍 Quality after escalation to {model_short}: {score}/10")
+            else:
+                print(f"🔍 Retry {attempt} quality: {score}/10")
 
-        if score >= quality_target:
-            print(f"   ✓ Quality target met ({score}/{quality_target})")
-            return best_content, validation
+            if score >= quality_target:
+                print(f"   ✓ Quality target met ({score}/{quality_target})")
+                return best_content, validation
 
-        if score > best_score:
-            best_score = score
-            best_content_at_best = best_content
+            if score > best_score:
+                best_score = score
+                best_validation = validation
 
-        if attempt >= max_retries:
-            print(f"   ⚠ Max retries reached, using best ({best_score}/10)")
-            break
+            if attempt >= max_retries:
+                break
 
-        if not gaps or gaps == ["Validation parse failed"]:
-            print(f"   ⚠ No actionable gaps, skipping retry")
-            break
+            if not gaps or gaps == ["Validation parse failed"]:
+                print(f"   ⚠ No actionable gaps, skipping retry")
+                break
 
-        # ── Reason + Act: fix identified gaps ──
-        gaps_str = "\n".join(f"- {g}" for g in gaps)
-        print(f"   🔧 Fixing {len(gaps)} gaps…")
+            # ── Fix identified gaps ──
+            gaps_str = "\n".join(f"- {g}" for g in gaps)
+            print(f"   🔧 Fixing {len(gaps)} gaps…")
+            source_excerpt = source_text[:35000] if source_text else ""
 
-        # Send truncated source to stay within context limits
-        source_excerpt = source_text[:35000] if source_text else ""
+            fixed = llm.generate(
+                "You are SkillForge's repair agent. Fix all gaps in this skill file.",
+                GAP_FIX_PROMPT.format(
+                    score=score,
+                    gaps=gaps_str,
+                    skill_content=best_content,
+                    source_excerpt=source_excerpt,
+                ),
+                max_tokens=16000,
+            )
 
-        fixed = llm.generate(
-            "You are SkillForge's repair agent. Fix all gaps in this skill file.",
-            GAP_FIX_PROMPT.format(
-                score=score,
-                gaps=gaps_str,
-                skill_content=best_content,
-                source_excerpt=source_excerpt,
-            ),
-            max_tokens=16000,
+            if fixed and len(fixed) > len(best_content) * 0.5:
+                best_content = clean_llm_output(fixed)
+                new_lines = best_content.count('\n')
+                print(f"   📝 Fixed version: {new_lines} lines")
+            else:
+                print(f"   ⚠ Fix pass returned insufficient content, keeping previous")
+                break
+
+            time.sleep(2)
+
+        # ── Inner loop exhausted — try escalation ──
+        if best_score >= quality_target:
+            return best_content, best_validation
+
+        # Check if escalation is available (paid openrouter only)
+        can_escalate = (
+            hasattr(llm, '_paid') and llm._paid
+            and hasattr(llm, 'escalate_for_quality')
+            and escalations < max_escalations
         )
 
-        if fixed and len(fixed) > len(best_content) * 0.5:
-            best_content = clean_llm_output(fixed)
-            new_lines = best_content.count('\n')
-            print(f"   📝 Fixed version: {new_lines} lines")
-        else:
-            print(f"   ⚠ Fix pass returned insufficient content, keeping previous")
+        if not can_escalate:
+            if best_score < quality_target:
+                print(f"   ⚠ Max retries reached, using best ({best_score}/10)")
             break
 
-        time.sleep(2)  # Rate limit courtesy
+        # Escalate to stronger model
+        if llm.escalate_for_quality(best_score, quality_target):
+            escalations += 1
+            # Re-run fix with the stronger model (not from scratch — use best content so far)
+            print(f"   🔧 Re-running repair with stronger model…")
+            source_excerpt = source_text[:35000] if source_text else ""
+
+            # Get current gaps
+            validation = validate_skill(best_content, llm)
+            gaps = validation.get("gaps", [])
+            score = validation.get("score", 0)
+
+            if score >= quality_target:
+                print(f"   ✓ Stronger model validates at {score}/{quality_target}")
+                return best_content, validation
+
+            if gaps and gaps != ["Validation parse failed"]:
+                gaps_str = "\n".join(f"- {g}" for g in gaps)
+                fixed = llm.generate(
+                    "You are SkillForge's repair agent. Fix all gaps in this skill file. "
+                    "Be thorough — this is an escalation pass with a stronger model.",
+                    GAP_FIX_PROMPT.format(
+                        score=score,
+                        gaps=gaps_str,
+                        skill_content=best_content,
+                        source_excerpt=source_excerpt,
+                    ),
+                    max_tokens=16000,
+                )
+
+                if fixed and len(fixed) > len(best_content) * 0.5:
+                    best_content = clean_llm_output(fixed)
+                    new_lines = best_content.count('\n')
+                    print(f"   📝 Escalated fix: {new_lines} lines")
+
+                    # Validate the escalated fix
+                    validation = validate_skill(best_content, llm)
+                    score = validation.get("score", 0)
+                    print(f"🔍 Post-escalation quality: {score}/10")
+
+                    if score >= quality_target:
+                        print(f"   ✓ Quality target met after escalation ({score}/{quality_target})")
+                        return best_content, validation
+
+                    if score > best_score:
+                        best_score = score
+                        best_validation = validation
+
+            # Continue to next escalation if still below target
+            continue
+        else:
+            print(f"   ⚠ No more models to escalate to, using best ({best_score}/10)")
+            break
 
     # Return best we got
-    final_validation = validate_skill(best_content, llm) if best_score < 7 else validation
+    final_validation = validate_skill(best_content, llm) if best_score < 7 else (best_validation or validate_skill(best_content, llm))
     return best_content, final_validation
 
 
