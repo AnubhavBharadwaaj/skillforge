@@ -1,55 +1,91 @@
 #!/usr/bin/env python3
 """
-SkillForge v3 — Agentic Research Knowledge → LLM Skill File Pipeline
+skillforge_complete.py — SkillForge v5: Complete-Source + Anti-Hallucination
 
-v3 changes:
-  - AGENTIC: quality-gate retry loop (validate → fix gaps → re-validate, up to 3 rounds)
-  - FIX: Gemini safety filter crash (finish_reason 2) handled gracefully
-  - FIX: Rate limit retry with exponential backoff
-  - QUALITY: GitHub prompt extracts math from code comments + demands benchmark results
-  - QUALITY: Validation sends less content to avoid safety filter triggers
+Changes from v4 (all driven by harsh-critic review):
 
-Usage:
-  python skillforge.py --github https://github.com/owner/repo
-  python skillforge.py --arxiv 2103.13630
-  python skillforge.py --pdf paper.pdf
-  python skillforge.py batch --list sources.txt
-  python skillforge.py --arxiv 2103.13630 --provider gemini --model gemini-2.5-flash
-  python skillforge.py --arxiv 2103.13630 --provider openrouter
-  python skillforge.py --arxiv 2103.13630 --no-llm
+  Severity 1 (correctness):
+    1. Verifier number matching uses digit-aware boundaries (no more "3"
+       matching inside "13"; "1.5" not matching inside "21.5"). Other
+       claim types use \\w word boundaries instead of raw substring.
+    2. YAML `description:` is now verified (only `name:`/`id:`/`version:`
+       are skipped — those are metadata, not source claims).
+    3. `extract_skill_name` only reads inside the YAML frontmatter span.
+    4. `git clone` has a hard timeout (default 300s, configurable).
+    5. Submodules cloned by default (--recurse-submodules).
+
+  Severity 2 (completeness):
+    6. Web sources do same-origin BFS crawl (--crawl-pages, default 25).
+    7. `llms.txt` is parsed as a URL manifest; each listed URL fetched.
+    8. Auto-scroll iterates ALL scrollable containers (not just body).
+    9. Main-content extraction via trafilatura strips sidebar/nav noise.
+
+  Others:
+   11. Agentic regeneration loop: verifier output feeds back into LLM
+       with "delete or replace from source" up to --agentic-retries.
+   12. Smart prioritized truncation: repos sort by README → manifest →
+       config → core → other → tests; papers keep abstract + middle
+       (methods) + tail.
+   13. Repo-clone cache: blob/PR/repo URLs to same (owner, repo) share
+       one clone.
+   14. Skill-name collisions disambiguated with short hash of source URL.
+   15. Verifier knows common ML/CS acronyms (Adam, BERT, ReLU, JSON, ...).
+   16. Path traversal protection via abspath + prefix check.
+   17. Startup banner warns when no GITHUB_TOKEN and GitHub API needed.
+   18. Per-repo max size guard; above limit, fall back to priority-cap.
+   19. GitHubFetcher.cleanup() via weakref finalizer + atexit.
+   20. --json emits one machine-readable line per source to stdout.
+   21. Verifier dedupes within-line by VALUE (not (value, type)).
+   22. Per-section verification breakdown in VERIFICATION.md.
+   23. Unicode normalization (NFKD + ASCII fold) on source and claims.
 
 Install:
-  pip install anthropic PyMuPDF google-generativeai openai
+  pip install anthropic google-generativeai openai PyMuPDF \\
+              requests beautifulsoup4 html2text playwright lxml trafilatura
+  playwright install chromium     # for full dynamic-page fidelity
 """
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+import weakref
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-import argparse, datetime, json, os, re, shutil, subprocess
-import sys, tempfile, time, urllib.request
-import threading
-from pathlib import Path
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TERMINAL SPINNER — keeps terminal alive during API calls
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ─────────────────────────────────────────────────────────────
+# TERMINAL UI
+# ─────────────────────────────────────────────────────────────
 
 class Spinner:
-    """Animated spinner that runs during long API calls.
-    Usage:
-        with Spinner("Extracting chunk 1/3"):
-            result = llm.call(...)
-    """
-    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
-    def __init__(self, message="Working", show_elapsed=True):
+    def __init__(self, message="Working"):
         self.message = message
-        self.show_elapsed = show_elapsed
         self._stop = threading.Event()
         self._thread = None
-        self._start_time = None
+        self._start_time = 0.0
 
     def __enter__(self):
         self._start_time = time.time()
@@ -58,1933 +94,2181 @@ class Spinner:
         self._thread.start()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *a):
         self._stop.set()
-        self._thread.join()
+        if self._thread:
+            self._thread.join()
         elapsed = time.time() - self._start_time
-        # Clear spinner line and print completion
         sys.stdout.write(f"\r   ✓ {self.message} ({elapsed:.1f}s)\033[K\n")
         sys.stdout.flush()
 
     def _spin(self):
         i = 0
         while not self._stop.is_set():
-            frame = self.FRAMES[i % len(self.FRAMES)]
-            elapsed = time.time() - self._start_time
-            if self.show_elapsed:
-                line = f"\r   {frame} {self.message} [{elapsed:.0f}s]"
-            else:
-                line = f"\r   {frame} {self.message}"
-            sys.stdout.write(f"{line}\033[K")
+            f = self.FRAMES[i % len(self.FRAMES)]
+            el = time.time() - self._start_time
+            sys.stdout.write(f"\r   {f} {self.message} [{el:.0f}s]\033[K")
             sys.stdout.flush()
             i += 1
             self._stop.wait(0.1)
 
-    def update(self, new_message):
-        """Update message mid-spin."""
-        self.message = new_message
+    def update(self, msg):
+        self.message = msg
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# OPTIONAL IMPORTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _require_anthropic():
-    try: import anthropic; return anthropic
-    except ImportError: print("❌ pip install anthropic"); sys.exit(1)
-
-def _require_gemini():
-    try: import google.generativeai as genai; return genai
-    except ImportError: print("❌ pip install google-generativeai"); sys.exit(1)
-
-def _require_openai():
-    try: import openai; return openai
-    except ImportError: print("❌ pip install openai"); sys.exit(1)
-
-def _require_fitz():
-    try: import fitz; return fitz
-    except ImportError: print("❌ pip install PyMuPDF"); sys.exit(1)
+def banner(text, char="═"):
+    line = char * max(len(text) + 4, 60)
+    print(f"\n{line}\n  {text}\n{line}")
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SHARED UTILS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def section(text):
+    print(f"\n{'─'*60}\n  {text}\n{'─'*60}")
+
 
 def sizeof_fmt(n):
     for u in ("B","KB","MB","GB"):
-        if abs(n) < 1024: return f"{n:.1f} {u}"
+        if abs(n) < 1024:
+            return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} TB"
 
-def estimate_tokens(text): return int(len(text) / 3.5)
 
-def clean_llm_output(text):
-    text = text.strip()
-    for pfx in ("```markdown", "```md", "```yaml", "```"):
-        if text.startswith(pfx): text = text[len(pfx):].strip(); break
-    if text.endswith("```"): text = text[:-3].strip()
-    return text
+def slugify(s):
+    s = re.sub(r'https?://', '', s.strip())
+    s = re.sub(r'[^a-zA-Z0-9._-]+', '_', s)
+    return s.strip('_')[:80]
+
+
+def short_hash(s, n=8):
+    return hashlib.md5(s.encode("utf-8", errors="replace")).hexdigest()[:n]
+
+
+def safe_join(base, rel):
+    """Path-traversal-safe join. Returns absolute path or None if escapes base."""
+    base_abs = os.path.abspath(base)
+    rel = rel.replace("\\", "/")
+    target = os.path.abspath(os.path.join(base_abs, rel))
+    if target != base_abs and not target.startswith(base_abs + os.sep):
+        return None
+    return target
+
+
+def norm_text(s):
+    """Unicode-normalize for matching: NFKD, ASCII-fold, lowercase."""
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    folded = nfkd.encode("ascii", "ignore").decode("ascii")
+    return folded.lower()
+
+
+# ─────────────────────────────────────────────────────────────
+# OPTIONAL IMPORTS
+# ─────────────────────────────────────────────────────────────
+
+def _try_import(module, install_hint):
+    try:
+        return __import__(module)
+    except ImportError:
+        return None
+
+
+def _require(module, install_hint):
+    try:
+        return __import__(module)
+    except ImportError:
+        print(f"❌ Required: {install_hint}")
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────
+# SOURCE TYPE DETECTION
+# ─────────────────────────────────────────────────────────────
+
+GITHUB_RE = re.compile(
+    r'^(?:https?://)?(?:www\.)?github\.com/(?P<owner>[^/]+)(?:/(?P<repo>[^/]+))?'
+    r'(?:/(?P<kind>blob|tree|pull|issues|releases|raw)/(?P<rest>.+))?/?$'
+)
+ARXIV_ID_RE = re.compile(r'^\d{4}\.\d{4,5}(v\d+)?$')
+
+
+@dataclass
+class SourceSpec:
+    raw: str
+    kind: str
+    url: str
+    extra: dict = field(default_factory=dict)
+
+
+def detect_source(raw):
+    s = raw.strip()
+    if not s or s.startswith("#"):
+        return SourceSpec(raw, "skip", "")
+
+    if os.path.isfile(s) and s.lower().endswith(".pdf"):
+        return SourceSpec(raw, "pdf", s)
+
+    if ARXIV_ID_RE.match(s):
+        return SourceSpec(raw, "arxiv", f"https://arxiv.org/abs/{s.split('v')[0]}",
+                          extra={"arxiv_id": s.split('v')[0]})
+
+    if "arxiv.org" in s:
+        m = re.search(r'arxiv\.org/(?:abs|pdf|html)/([\d.]+)', s)
+        if m:
+            return SourceSpec(raw, "arxiv", f"https://arxiv.org/abs/{m.group(1)}",
+                              extra={"arxiv_id": m.group(1)})
+
+    norm = s if s.startswith("http") else f"https://{s}"
+    gh = GITHUB_RE.match(norm)
+    if gh:
+        owner = gh.group("owner")
+        repo = gh.group("repo")
+        kind = gh.group("kind")
+        rest = gh.group("rest") or ""
+
+        if not repo:
+            return SourceSpec(raw, "github_org", f"https://github.com/{owner}",
+                              extra={"owner": owner})
+        if kind in ("blob", "raw"):
+            parts = rest.split("/", 1)
+            ref = parts[0] if parts else "HEAD"
+            path = parts[1] if len(parts) > 1 else ""
+            return SourceSpec(raw, "github_blob",
+                              f"https://github.com/{owner}/{repo}",
+                              extra={"owner": owner, "repo": repo,
+                                     "ref": ref, "path": path})
+        if kind == "pull":
+            pr = rest.split("/")[0] if rest else ""
+            return SourceSpec(raw, "github_pr",
+                              f"https://github.com/{owner}/{repo}/pull/{pr}",
+                              extra={"owner": owner, "repo": repo, "pr": pr})
+        if kind == "tree":
+            return SourceSpec(raw, "github_repo",
+                              f"https://github.com/{owner}/{repo}",
+                              extra={"owner": owner, "repo": repo,
+                                     "ref": rest.split("/")[0] if rest else None})
+        return SourceSpec(raw, "github_repo",
+                          f"https://github.com/{owner}/{repo}",
+                          extra={"owner": owner, "repo": repo})
+
+    if s.lower().endswith("llms.txt"):
+        return SourceSpec(raw, "llms_manifest", norm)
+
+    if s.endswith(".txt") or s.endswith(".md"):
+        return SourceSpec(raw, "text", norm)
+
+    if s.lower().endswith(".pdf") and s.startswith("http"):
+        return SourceSpec(raw, "pdf", norm, extra={"is_url": True})
+
+    if s.startswith("http") or (re.match(r'^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}', s) and " " not in s):
+        return SourceSpec(raw, "web", norm)
+
+    return SourceSpec(raw, "unknown", norm)
+
+
+# ─────────────────────────────────────────────────────────────
+# WEB DOWNLOADER — Playwright + container-scroll + crawler
+# ─────────────────────────────────────────────────────────────
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 SkillForge/5.0"
+)
+
+_NOFOLLOW_EXT = (".png",".jpg",".jpeg",".gif",".svg",".webp",".ico",
+                 ".pdf",".zip",".tar",".gz",".mp4",".mp3",".woff",
+                 ".woff2",".ttf",".css",".js",".json",".xml")
+
+
+class WebDownloader:
+    def __init__(self, headless=True, max_scroll_passes=15, scroll_wait_ms=600,
+                 navigation_timeout_ms=60000, crawl_pages=25):
+        self.headless = headless
+        self.max_scroll_passes = max_scroll_passes
+        self.scroll_wait_ms = scroll_wait_ms
+        self.nav_timeout = navigation_timeout_ms
+        self.crawl_pages = crawl_pages
+        self._playwright_ok = self._check_playwright()
+        if not self._playwright_ok:
+            print("   ⚠ Playwright unavailable — falling back to requests for HTML")
+            print("     (install: pip install playwright && playwright install chromium)")
+
+    @staticmethod
+    def _check_playwright():
+        try:
+            from playwright.sync_api import sync_playwright  # noqa
+            return True
+        except Exception:
+            return False
+
+    def fetch(self, url):
+        if url.endswith(".txt") or url.endswith(".md"):
+            return self._fetch_text_url(url)
+        if self._playwright_ok:
+            try:
+                return self._fetch_playwright(url)
+            except Exception as e:
+                print(f"   ⚠ Playwright failed for {url}: {type(e).__name__}: {e}")
+                print(f"   ↳ falling back to requests")
+        return self._fetch_requests(url)
+
+    def _fetch_text_url(self, url):
+        req = _require("requests", "pip install requests")
+        with Spinner(f"GET {url[:50]}"):
+            r = req.get(url, headers={"User-Agent": DEFAULT_UA}, timeout=30)
+            r.raise_for_status()
+        text = r.text
+        return {"url": url, "html": "", "text": text, "markdown": text,
+                "final_url": r.url, "method": "requests-text"}
+
+    def _fetch_playwright(self, url):
+        from playwright.sync_api import sync_playwright
+        with Spinner(f"Headless GET {url[:50]}") as sp:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=self.headless)
+                ctx = browser.new_context(
+                    user_agent=DEFAULT_UA,
+                    viewport={"width": 1400, "height": 900},
+                    java_script_enabled=True,
+                )
+                page = ctx.new_page()
+                page.set_default_navigation_timeout(self.nav_timeout)
+                try:
+                    page.goto(url, wait_until="domcontentloaded")
+                except Exception:
+                    page.goto(url, wait_until="load")
+                page.wait_for_timeout(800)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+
+                sp.update(f"Scrolling {url[:45]}")
+                # Scroll window + every overflow:auto container (fix #8)
+                scroll_all_js = r"""
+                () => {
+                    let total = 0;
+                    window.scrollTo(0, document.documentElement.scrollHeight);
+                    total += document.documentElement.scrollHeight;
+                    const all = document.querySelectorAll('*');
+                    for (const el of all) {
+                        try {
+                            const cs = getComputedStyle(el);
+                            if (el.scrollHeight > el.clientHeight + 10 &&
+                                /auto|scroll/.test(cs.overflowY || cs.overflow)) {
+                                el.scrollTop = el.scrollHeight;
+                                total += el.scrollHeight;
+                            }
+                        } catch (e) {}
+                    }
+                    return total;
+                }
+                """
+                last_total = -1
+                stable = 0
+                for _ in range(self.max_scroll_passes):
+                    try:
+                        total = page.evaluate(scroll_all_js)
+                    except Exception:
+                        total = 0
+                    page.wait_for_timeout(self.scroll_wait_ms)
+                    if total == last_total:
+                        stable += 1
+                        if stable >= 2:
+                            break
+                    else:
+                        stable = 0
+                    last_total = total
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+
+                html = page.content()
+                final_url = page.url
+                inner = page.evaluate("() => document.body ? document.body.innerText : ''")
+                browser.close()
+
+        md = self._html_to_markdown(html, url=final_url) or inner
+        return {"url": url, "html": html, "text": inner, "markdown": md,
+                "final_url": final_url, "method": "playwright"}
+
+    def _fetch_requests(self, url):
+        req = _require("requests", "pip install requests")
+        with Spinner(f"GET {url[:50]}"):
+            r = req.get(url, headers={"User-Agent": DEFAULT_UA, "Accept": "*/*"},
+                        timeout=30, allow_redirects=True)
+            r.raise_for_status()
+        html = r.text
+        md = self._html_to_markdown(html, url=r.url)
+        return {"url": url, "html": html, "text": "", "markdown": md,
+                "final_url": r.url, "method": "requests"}
+
+    @staticmethod
+    def _html_to_markdown(html, url=""):
+        """Prefer trafilatura main-content extraction; fall back to html2text."""
+        if not html:
+            return ""
+        # Tier 1: trafilatura strips sidebar/footer/nav (fix #9)
+        traf = _try_import("trafilatura", "pip install trafilatura")
+        if traf:
+            try:
+                got = traf.extract(html, include_links=True, include_tables=True,
+                                   include_comments=False, output_format="markdown",
+                                   url=url, favor_recall=True)
+                if got and len(got) > 200:
+                    return got
+            except Exception:
+                pass
+
+        # Tier 2: bs4 cleanup + html2text
+        bs4 = _try_import("bs4", "pip install beautifulsoup4")
+        h2t = _try_import("html2text", "pip install html2text")
+        text = html
+        if bs4:
+            from bs4 import BeautifulSoup
+            parser = "lxml" if _try_import("lxml", "pip install lxml") else "html.parser"
+            soup = BeautifulSoup(html, parser)
+            for sel in ["script", "style", "noscript", "iframe", "svg",
+                        "nav", "footer", "aside"]:
+                for el in soup.select(sel):
+                    el.decompose()
+            for cls in ["sidebar","side-bar","navbar","nav-bar","toc",
+                        "table-of-contents","site-footer","breadcrumbs",
+                        "cookie","consent"]:
+                for el in soup.select(f"[class*='{cls}'], [id*='{cls}']"):
+                    el.decompose()
+            text = str(soup)
+        if h2t:
+            conv = h2t.HTML2Text()
+            conv.body_width = 0
+            conv.ignore_images = False
+            conv.ignore_links = False
+            conv.protect_links = True
+            return conv.handle(text)
+        if bs4:
+            from bs4 import BeautifulSoup
+            return BeautifulSoup(text, "html.parser").get_text("\n")
+        return text
+
+    def crawl(self, root_url, max_pages=None):
+        """BFS same-origin crawl from root (fix #6)."""
+        if max_pages is None:
+            max_pages = self.crawl_pages
+        if max_pages <= 1:
+            return [self.fetch(root_url)]
+
+        root = root_url if root_url.startswith("http") else f"https://{root_url}"
+        base_host = urllib.parse.urlparse(root).netloc.lower()
+        base_path = urllib.parse.urlparse(root).path.rstrip("/")
+        path_prefix = ""
+        for p in ("/docs","/documentation","/guide","/guides","/api",
+                  "/manual","/reference","/help"):
+            if p in base_path:
+                idx = base_path.find(p)
+                path_prefix = base_path[: idx + len(p)]
+                break
+
+        seen = {self._normalize_url(root)}
+        queue = [root]
+        results = []
+        print(f"   🕸  Crawling {base_host}"
+              f"{' (prefix='+path_prefix+')' if path_prefix else ''} "
+              f"up to {max_pages} pages")
+        while queue and len(results) < max_pages:
+            url = queue.pop(0)
+            try:
+                r = self.fetch(url)
+            except Exception as e:
+                print(f"   ⚠ crawl: {url} -> {type(e).__name__}: {e}")
+                continue
+            results.append(r)
+            html = r.get("html") or ""
+            for link in self._extract_links(html, url):
+                pu = urllib.parse.urlparse(link)
+                if pu.netloc.lower() != base_host:
+                    continue
+                if any(link.lower().endswith(ext) for ext in _NOFOLLOW_EXT):
+                    continue
+                if path_prefix and not pu.path.startswith(path_prefix):
+                    continue
+                nl = self._normalize_url(link)
+                if nl in seen:
+                    continue
+                if len(seen) >= max_pages * 3:
+                    continue
+                seen.add(nl)
+                queue.append(link)
+        print(f"   ✓ Crawled {len(results)} page(s) from {base_host}")
+        return results
+
+    @staticmethod
+    def _normalize_url(u):
+        pu = urllib.parse.urlparse(u)
+        clean = pu._replace(fragment="").geturl()
+        return clean.rstrip("/").lower()
+
+    @staticmethod
+    def _extract_links(html, base):
+        bs4 = _try_import("bs4", "pip install beautifulsoup4")
+        if not bs4 or not html:
+            return []
+        from bs4 import BeautifulSoup
+        parser = "lxml" if _try_import("lxml", "pip install lxml") else "html.parser"
+        soup = BeautifulSoup(html, parser)
+        out = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href or href.startswith(("#","javascript:","mailto:","tel:")):
+                continue
+            out.append(urllib.parse.urljoin(base, href))
+        return out
+
+    def fetch_or_crawl(self, url, force_single=False, max_pages=None):
+        if force_single or (max_pages is not None and max_pages <= 1):
+            return [self.fetch(url)]
+        pu = urllib.parse.urlparse(url if url.startswith("http") else f"https://{url}")
+        path = pu.path.lower()
+        is_docs = any(t in path for t in ("/docs","/documentation","/guide",
+                                          "/reference","/manual","/api/")) \
+                  or any(t in pu.netloc.lower() for t in ("docs.","gitbook.io",
+                                                          "readthedocs",
+                                                          "developer.","developers."))
+        if is_docs:
+            return self.crawl(url, max_pages=max_pages)
+        return [self.fetch(url)]
+# ─────────────────────────────────────────────────────────────
+# GITHUB FETCHER — full clone, cached, submodule-aware, size-bounded
+# ─────────────────────────────────────────────────────────────
+
+SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", "venv", ".venv", "env", "dist", "build", "target",
+    ".idea", ".vscode", ".eggs", ".ipynb_checkpoints", "site-packages",
+}
+
+BINARY_EXTS = {
+    ".png",".jpg",".jpeg",".gif",".webp",".bmp",".ico",".tif",".tiff",
+    ".pdf",".zip",".gz",".tar",".tgz",".bz2",".xz",".7z",".rar",
+    ".mp3",".mp4",".wav",".ogg",".webm",".mov",".avi",".mkv",
+    ".ttf",".otf",".woff",".woff2",".eot",
+    ".so",".dylib",".dll",".exe",".o",".a",".pyc",".pyo",
+    ".whl",".egg",
+    ".class",".jar",".onnx",".pt",".pth",".safetensors",".bin",
+    ".npz",".npy",".h5",".hdf5",".parquet",".arrow",
+}
+
+# Priority order for file content inclusion (fix #12)
+FILE_PRIORITY_PATTERNS = [
+    (re.compile(r"(^|/)README", re.I), 0),
+    (re.compile(r"\.md$|\.mdx$|\.rst$", re.I), 1),
+    (re.compile(r"(^|/)(setup\.py|pyproject\.toml|package\.json|Cargo\.toml|go\.mod|build\.gradle|pom\.xml)$", re.I), 2),
+    (re.compile(r"(^|/)requirements.*\.txt$|(^|/)Pipfile|(^|/)poetry\.lock$", re.I), 3),
+    (re.compile(r"(^|/)config|\.toml$|\.yaml$|\.yml$", re.I), 4),
+    (re.compile(r"model|architecture|network", re.I), 5),
+    (re.compile(r"train|inference|infer|loss|optim", re.I), 6),
+    (re.compile(r"(^|/)src/|(^|/)lib/|(^|/)core/|(^|/)main\.|(^|/)index\.", re.I), 7),
+    (re.compile(r"\.py$|\.ts$|\.tsx$|\.js$|\.jsx$|\.rs$|\.go$|\.java$|\.kt$", re.I), 8),
+    (re.compile(r"(^|/)examples?/|(^|/)demos?/", re.I), 10),
+    (re.compile(r"(^|/)docs?/", re.I), 11),
+    (re.compile(r"(^|/)tests?/|test_|_test\.|\.test\.|spec_|_spec\.", re.I), 90),
+]
+
+
+def _file_priority(path):
+    for pat, score in FILE_PRIORITY_PATTERNS:
+        if pat.search(path):
+            return score
+    return 50
+
+
+@dataclass
+class RepoDump:
+    owner: str
+    repo: str
+    url: str
+    clone_dir: str
+    files: list
+    binaries: list
+    tree: str
+    extra_text: str = ""
+
+
+class GitHubFetcher:
+    """Full clone, submodule-aware, cached, size-bounded, timed."""
+
+    def __init__(self, tmpdir=None, github_token=None, clone_timeout=300,
+                 recurse_submodules=True, max_repo_mb=800):
+        self.tmpdir = tmpdir or tempfile.mkdtemp(prefix="sf_gh_")
+        self.token = github_token or os.environ.get("GITHUB_TOKEN")
+        self.clone_timeout = clone_timeout
+        self.recurse_submodules = recurse_submodules
+        self.max_repo_mb = max_repo_mb
+        os.makedirs(self.tmpdir, exist_ok=True)
+        self._repo_cache = {}  # (owner, repo, ref) → RepoDump (fix #13)
+        # Auto-cleanup via finalizer (fix #19)
+        self._finalizer = weakref.finalize(self, self._cleanup_paths, [self.tmpdir])
+
+    @staticmethod
+    def _cleanup_paths(paths):
+        for p in paths:
+            shutil.rmtree(p, ignore_errors=True)
+
+    def cleanup(self):
+        self._finalizer()
+
+    def fetch(self, spec):
+        if spec.kind == "github_repo":
+            return self._fetch_repo(spec.extra["owner"], spec.extra["repo"],
+                                    spec.extra.get("ref"))
+        if spec.kind == "github_blob":
+            return self._fetch_blob(spec)
+        if spec.kind == "github_pr":
+            return self._fetch_pr(spec)
+        if spec.kind == "github_org":
+            return self._fetch_org(spec)
+        raise ValueError(f"Not a github kind: {spec.kind}")
+
+    def _clone(self, owner, repo, ref=None, shallow=False):
+        url = f"https://github.com/{owner}/{repo}.git"
+        if self.token:
+            url = url.replace("https://", f"https://{self.token}@")
+        dest = os.path.join(self.tmpdir, f"{owner}__{repo}__{short_hash(ref or '')}")
+        if os.path.exists(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+
+        cmd = ["git", "clone"]
+        if shallow:
+            cmd += ["--depth", "1", "--single-branch"]
+        if self.recurse_submodules:
+            cmd += ["--recurse-submodules", "--shallow-submodules"]
+        cmd += [url, dest]
+
+        with Spinner(f"git clone {owner}/{repo}{' (shallow)' if shallow else ''}"):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=self.clone_timeout)
+            except subprocess.TimeoutExpired:
+                shutil.rmtree(dest, ignore_errors=True)
+                if not shallow:
+                    print(f"   ↳ full clone timed out, retrying shallow")
+                    return self._clone(owner, repo, ref, shallow=True)
+                raise RuntimeError(
+                    f"git clone timed out after {self.clone_timeout}s for {owner}/{repo}"
+                )
+        if r.returncode != 0:
+            if not shallow:
+                print(f"   ↳ full clone failed, retrying shallow")
+                return self._clone(owner, repo, ref, shallow=True)
+            raise RuntimeError(f"git clone failed: {r.stderr.strip()[:300]}")
+
+        if ref:
+            with Spinner(f"checkout {ref[:30]}"):
+                subprocess.run(["git", "-C", dest, "fetch", "origin", ref],
+                               capture_output=True, text=True, timeout=120)
+                subprocess.run(["git", "-C", dest, "checkout", ref],
+                               capture_output=True, text=True, timeout=60)
+        return dest
+
+    def _repo_size_bytes(self, root):
+        total = 0
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d not in SKIP_DIRS]
+            for fn in fns:
+                try:
+                    total += os.path.getsize(os.path.join(dp, fn))
+                except Exception:
+                    pass
+        return total
+
+    def _walk(self, root, priority_cap=None):
+        text_files = []
+        binary_files = []
+        tree_lines = []
+        root_path = Path(root)
+
+        def emit_tree(d, depth=0):
+            if depth > 8:
+                return
+            try:
+                entries = sorted(d.iterdir(),
+                                 key=lambda e: (not e.is_dir(), e.name.lower()))
+            except Exception:
+                return
+            for e in entries:
+                if e.is_dir() and e.name in SKIP_DIRS:
+                    continue
+                indent = "  " * depth
+                if e.is_dir():
+                    tree_lines.append(f"{indent}{e.name}/")
+                    emit_tree(e, depth + 1)
+                else:
+                    try:
+                        sz = e.stat().st_size
+                        tree_lines.append(f"{indent}{e.name}  ({sizeof_fmt(sz)})")
+                    except Exception:
+                        tree_lines.append(f"{indent}{e.name}")
+        emit_tree(root_path)
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for fn in sorted(filenames):
+                fp = Path(dirpath) / fn
+                try:
+                    rel = str(fp.relative_to(root_path))
+                except ValueError:
+                    continue
+                try:
+                    sz = fp.stat().st_size
+                except Exception:
+                    continue
+                ext = fp.suffix.lower()
+                if ext in BINARY_EXTS:
+                    binary_files.append((rel, sz))
+                    continue
+                if priority_cap is not None and _file_priority(rel) > priority_cap:
+                    binary_files.append((rel, sz))
+                    continue
+                try:
+                    with open(fp, "rb") as f:
+                        head = f.read(8192)
+                except Exception:
+                    binary_files.append((rel, sz))
+                    continue
+                if b"\x00" in head:
+                    binary_files.append((rel, sz))
+                    continue
+                try:
+                    raw = fp.read_bytes()
+                    text = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    binary_files.append((rel, sz))
+                    continue
+                if ext == ".ipynb":
+                    text = self._flatten_ipynb(text)
+                text_files.append((rel, text))
+
+        # Priority-sort so downstream truncation keeps the important stuff
+        text_files.sort(key=lambda t: (_file_priority(t[0]), t[0]))
+        return text_files, binary_files, "\n".join(tree_lines)
+
+    @staticmethod
+    def _flatten_ipynb(content):
+        try:
+            nb = json.loads(content)
+        except Exception:
+            return content
+        out = []
+        for i, c in enumerate(nb.get("cells", [])):
+            src = "".join(c.get("source", []))
+            if src.strip():
+                out.append(f"# Cell {i+1} [{c.get('cell_type', '?')}]\n{src}")
+            for output in c.get("outputs", []):
+                txt = output.get("text") or output.get("data", {}).get("text/plain")
+                if isinstance(txt, list):
+                    txt = "".join(txt)
+                if isinstance(txt, str) and txt.strip():
+                    out.append(f"# Output of cell {i+1}\n{txt[:2000]}")
+        return "\n\n".join(out)
+
+    def _fetch_repo(self, owner, repo, ref=None):
+        key = (owner.lower(), repo.lower(), ref or "")
+        if key in self._repo_cache:
+            print(f"   ♻️  Reusing cached clone of {owner}/{repo}")
+            return self._repo_cache[key]
+
+        dest = self._clone(owner, repo, ref, shallow=False)
+        size = self._repo_size_bytes(dest)
+        priority_cap = None
+        if size > self.max_repo_mb * 1024 * 1024:
+            print(f"   ⚠ Repo size {sizeof_fmt(size)} > {self.max_repo_mb}MB limit")
+            print(f"   ↳ falling back to priority-filtered subset (priority<=8)")
+            priority_cap = 8
+
+        text_files, bins, tree = self._walk(dest, priority_cap=priority_cap)
+        print(f"   ✓ {len(text_files)} text files, {len(bins)} binary/excluded")
+        dump = RepoDump(owner=owner, repo=repo,
+                        url=f"https://github.com/{owner}/{repo}",
+                        clone_dir=dest, files=text_files,
+                        binaries=bins, tree=tree)
+        self._repo_cache[key] = dump
+        return dump
+
+    def _fetch_blob(self, spec):
+        owner = spec.extra["owner"]
+        repo = spec.extra["repo"]
+        ref = spec.extra.get("ref")
+        path = spec.extra.get("path", "")
+        dump = self._fetch_repo(owner, repo, ref=ref)
+        if path:
+            found = False
+            for rel, content in dump.files:
+                if rel == path:
+                    dump.extra_text = (
+                        f"### Primary file (from blob URL): `{path}`\n\n{content}\n"
+                    )
+                    found = True
+                    break
+            if not found:
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+                req = _try_import("requests", "pip install requests")
+                if req:
+                    try:
+                        r = req.get(raw_url, headers={"User-Agent": DEFAULT_UA},
+                                    timeout=30)
+                        if r.ok:
+                            dump.extra_text = (
+                                f"### Primary file (raw): `{path}`\n\n{r.text}\n"
+                            )
+                            dump.files.append((path, r.text))
+                    except Exception:
+                        pass
+        return dump
+
+    def _fetch_pr(self, spec):
+        owner = spec.extra["owner"]; repo = spec.extra["repo"]; pr = spec.extra["pr"]
+        req = _try_import("requests", "pip install requests")
+        if not req:
+            print(f"   ⚠ requests missing — falling back to repo clone only")
+            return self._fetch_repo(owner, repo)
+
+        headers = {"User-Agent": DEFAULT_UA, "Accept": "application/vnd.github+json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        api = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}"
+        pr_body = ""
+        head_ref = None
+        try:
+            with Spinner(f"PR #{pr} metadata"):
+                r = req.get(api, headers=headers, timeout=30)
+                if r.ok:
+                    j = r.json()
+                    pr_body = f"# PR #{pr}: {j.get('title','')}\n\n{j.get('body','') or ''}\n"
+                    head_ref = (j.get("head") or {}).get("ref")
+        except Exception as e:
+            print(f"   ⚠ PR metadata fetch failed: {e}")
+
+        diff = ""
+        try:
+            with Spinner(f"PR #{pr} diff"):
+                r = req.get(api,
+                            headers={**headers, "Accept": "application/vnd.github.v3.diff"},
+                            timeout=60)
+                if r.ok:
+                    diff = r.text
+        except Exception as e:
+            print(f"   ⚠ PR diff fetch failed: {e}")
+
+        comments_parts = []
+        try:
+            with Spinner(f"PR #{pr} comments"):
+                r = req.get(f"{api}/comments", headers=headers, timeout=30)
+                if r.ok:
+                    for c in r.json()[:200]:
+                        comments_parts.append(
+                            f"### {c.get('user',{}).get('login','?')} on {c.get('path','')}:\n{c.get('body','')}"
+                        )
+                r2 = req.get(f"https://api.github.com/repos/{owner}/{repo}/issues/{pr}/comments",
+                             headers=headers, timeout=30)
+                if r2.ok:
+                    for c in r2.json()[:200]:
+                        comments_parts.append(
+                            f"### {c.get('user',{}).get('login','?')}:\n{c.get('body','')}"
+                        )
+        except Exception as e:
+            print(f"   ⚠ PR comments fetch failed: {e}")
+        comments = "\n\n".join(comments_parts)
+
+        dump = self._fetch_repo(owner, repo, ref=head_ref)
+        extra = []
+        if pr_body:
+            extra.append(pr_body)
+        if diff:
+            extra.append(f"## Diff\n\n```diff\n{diff}\n```")
+        if comments:
+            extra.append(f"## Review comments\n\n{comments}")
+        dump.extra_text = ((dump.extra_text + "\n\n") if dump.extra_text else "") + \
+                          "\n\n".join(extra)
+        return dump
+
+    def _fetch_org(self, spec, max_repos=25):
+        owner = spec.extra["owner"]
+        req = _try_import("requests", "pip install requests")
+        repos = []
+        if req:
+            headers = {"User-Agent": DEFAULT_UA, "Accept": "application/vnd.github+json"}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            for api_pattern in (f"https://api.github.com/orgs/{owner}/repos",
+                                f"https://api.github.com/users/{owner}/repos"):
+                try:
+                    with Spinner(f"list {owner}/* via {api_pattern.split('/')[-2]}"):
+                        page = 1
+                        while page < 10 and len(repos) < max_repos:
+                            r = req.get(f"{api_pattern}?per_page=100&page={page}&type=public",
+                                        headers=headers, timeout=30)
+                            if not r.ok:
+                                break
+                            j = r.json()
+                            if not j:
+                                break
+                            for it in j:
+                                if isinstance(it, dict) and not it.get("fork") and not it.get("archived"):
+                                    repos.append(it["name"])
+                                if len(repos) >= max_repos:
+                                    break
+                            page += 1
+                    if repos:
+                        break
+                except Exception as e:
+                    print(f"   ⚠ org list failed: {e}")
+                    continue
+
+        if not repos:
+            print(f"   ⚠ No repos discovered for org {owner}")
+            return []
+
+        print(f"   ✓ Found {len(repos)} repos under {owner}, cloning all (cap={max_repos})")
+        dumps = []
+        for name in repos[:max_repos]:
+            try:
+                dumps.append(self._fetch_repo(owner, name))
+            except Exception as e:
+                print(f"   ⚠ {owner}/{name}: {e}")
+        return dumps
+
+
+# ─────────────────────────────────────────────────────────────
+# ARXIV FETCHER
+# ─────────────────────────────────────────────────────────────
+
+class ArxivFetcher:
+    def __init__(self, web, tmpdir=None):
+        self.web = web
+        self.tmpdir = tmpdir or tempfile.mkdtemp(prefix="sf_arxiv_")
+        os.makedirs(self.tmpdir, exist_ok=True)
+        self._finalizer = weakref.finalize(self, GitHubFetcher._cleanup_paths,
+                                           [self.tmpdir])
+
+    def cleanup(self):
+        self._finalizer()
+
+    def fetch(self, arxiv_id):
+        aid = arxiv_id.strip().split("v")[0]
+        html_text = ""
+        for src in (f"https://ar5iv.labs.arxiv.org/html/{aid}",
+                    f"https://arxiv.org/html/{aid}"):
+            try:
+                r = self.web.fetch(src)
+                if r.get("markdown") and len(r["markdown"]) > 1000:
+                    html_text = r["markdown"]
+                    print(f"   ✓ HTML version: {len(html_text):,} chars from {src}")
+                    break
+            except Exception as e:
+                print(f"   ⚠ {src}: {e}")
+
+        pdf_text = ""
+        pdf_path = os.path.join(self.tmpdir, f"{aid.replace('/','_')}.pdf")
+        try:
+            url = f"https://arxiv.org/pdf/{aid}.pdf"
+            with Spinner(f"PDF {url}"):
+                req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+                with urllib.request.urlopen(req, timeout=60) as r, open(pdf_path,"wb") as f:
+                    f.write(r.read())
+            pdf_text = self._extract_pdf(pdf_path, max_pages=999)
+            print(f"   ✓ PDF: {len(pdf_text):,} chars")
+        except Exception as e:
+            print(f"   ⚠ PDF fetch failed: {e}")
+
+        parts = []
+        if html_text:
+            parts.append(f"## ArXiv HTML version\n\n{html_text}")
+        if pdf_text:
+            parts.append(f"## ArXiv PDF version\n\n{pdf_text}")
+        return {"arxiv_id": aid, "html": html_text, "pdf_text": pdf_text,
+                "pdf_path": pdf_path if pdf_text else None,
+                "combined": "\n\n".join(parts)}
+
+    @staticmethod
+    def _extract_pdf(path, max_pages=999):
+        fitz = _try_import("fitz", "pip install PyMuPDF")
+        if not fitz:
+            return ""
+        doc = fitz.open(path)
+        pages = min(len(doc), max_pages)
+        parts = []
+        for i in range(pages):
+            parts.append(f"--- PAGE {i+1}/{pages} ---\n{doc[i].get_text('text')}")
+        doc.close()
+        return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────
+# UNIFIED BUNDLE + DISK PERSISTENCE
+# ─────────────────────────────────────────────────────────────
+
+@dataclass
+class SourceBundle:
+    spec: SourceSpec
+    text: str
+    files: dict = field(default_factory=dict)
+    on_disk_path: str = ""
+    skill_basename: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+def save_bundle(bundle, output_dir):
+    """Persist full downloaded source, path-traversal-safe (fix #16)."""
+    sdir = Path(output_dir) / ".sources" / bundle.skill_basename
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "source.txt").write_text(bundle.text, encoding="utf-8")
+    (sdir / "metadata.json").write_text(
+        json.dumps({"kind": bundle.spec.kind, "url": bundle.spec.url,
+                    "raw": bundle.spec.raw, **bundle.metadata}, indent=2),
+        encoding="utf-8",
+    )
+    if bundle.files:
+        files_dir = sdir / "files"
+        files_dir.mkdir(exist_ok=True)
+        files_base_abs = os.path.abspath(str(files_dir))
+        for relpath, content in bundle.files.items():
+            try:
+                target = safe_join(files_base_abs, relpath)
+                if not target:
+                    print(f"   ⚠ path-traversal blocked: {relpath}")
+                    continue
+                Path(os.path.dirname(target)).mkdir(parents=True, exist_ok=True)
+                Path(target).write_text(content, encoding="utf-8")
+            except Exception:
+                continue
+    bundle.on_disk_path = str(sdir)
+    print(f"   📦 Source preserved at {sdir} "
+          f"({sizeof_fmt(len(bundle.text.encode('utf-8')))})")
+# ─────────────────────────────────────────────────────────────
+# DOWNLOAD ORCHESTRATOR
+# ─────────────────────────────────────────────────────────────
+
+class Downloader:
+    def __init__(self, web=None, gh=None, arxiv=None, max_org_repos=25, crawl_pages=25):
+        self.web = web or WebDownloader(crawl_pages=crawl_pages)
+        self.gh = gh or GitHubFetcher()
+        self.arxiv = arxiv or ArxivFetcher(self.web)
+        self.max_org_repos = max_org_repos
+        self.crawl_pages = crawl_pages
+
+    def download(self, spec):
+        if spec.kind == "github_repo":
+            return self._bundle_repo(self.gh._fetch_repo(spec.extra["owner"],
+                                                        spec.extra["repo"],
+                                                        spec.extra.get("ref")),
+                                     spec)
+        if spec.kind == "github_blob":
+            return self._bundle_repo(self.gh._fetch_blob(spec), spec)
+        if spec.kind == "github_pr":
+            return self._bundle_repo(self.gh._fetch_pr(spec), spec)
+        if spec.kind == "github_org":
+            dumps = self.gh._fetch_org(spec, max_repos=self.max_org_repos)
+            return [self._bundle_repo(d, SourceSpec(
+                raw=f"{spec.raw}#{d.repo}",
+                kind="github_repo",
+                url=d.url,
+                extra={"owner": d.owner, "repo": d.repo},
+            )) for d in dumps]
+        if spec.kind == "arxiv":
+            r = self.arxiv.fetch(spec.extra["arxiv_id"])
+            return SourceBundle(
+                spec=spec, text=r["combined"],
+                files={"arxiv_html.md": r["html"], "arxiv_pdf.txt": r["pdf_text"]},
+                skill_basename=f"arxiv_{r['arxiv_id'].replace('/','_')}",
+                metadata={"arxiv_id": r["arxiv_id"]},
+            )
+        if spec.kind == "pdf":
+            return self._bundle_pdf(spec)
+        if spec.kind == "web":
+            return self._bundle_web(spec)
+        if spec.kind == "llms_manifest":
+            return self._bundle_llms_manifest(spec)
+        if spec.kind == "text":
+            r = self.web.fetch(spec.url)
+            return SourceBundle(
+                spec=spec, text=r["markdown"] or r["text"] or r["html"],
+                files={Path(spec.url).name or "page.txt": r["markdown"] or r["text"]},
+                skill_basename=slugify(spec.url),
+                metadata={"final_url": r.get("final_url")},
+            )
+        raise ValueError(f"Cannot download kind={spec.kind}")
+
+    def _bundle_repo(self, dump, spec):
+        parts = [
+            f"# Repository: {dump.owner}/{dump.repo}",
+            f"URL: {dump.url}",
+            f"Files: {len(dump.files)} text, {len(dump.binaries)} binary/excluded",
+            "",
+            "## Directory tree",
+            "```",
+            dump.tree,
+            "```",
+        ]
+        if dump.binaries:
+            parts.append("\n## Binary / excluded inventory")
+            for rel, sz in dump.binaries[:200]:
+                parts.append(f"- `{rel}` ({sizeof_fmt(sz)})")
+            if len(dump.binaries) > 200:
+                parts.append(f"- … +{len(dump.binaries) - 200} more")
+        if dump.extra_text:
+            parts.append("\n## Extra context\n")
+            parts.append(dump.extra_text)
+        parts.append("\n## File contents (priority-ordered)\n")
+        files_dict = {}
+        for rel, content in dump.files:
+            ext = Path(rel).suffix.lower().lstrip(".")
+            parts.append(f"### `{rel}`\n\n```{ext}\n{content}\n```\n")
+            files_dict[rel] = content
+        text = "\n".join(parts)
+        return SourceBundle(
+            spec=spec, text=text, files=files_dict,
+            skill_basename=f"{dump.owner}_{dump.repo}",
+            metadata={"owner": dump.owner, "repo": dump.repo,
+                      "n_files": len(dump.files), "n_binaries": len(dump.binaries)},
+        )
+
+    def _bundle_web(self, spec):
+        pages = self.web.fetch_or_crawl(spec.url, max_pages=self.crawl_pages)
+        if not pages:
+            return SourceBundle(spec=spec, text="", files={},
+                                skill_basename=slugify(spec.url), metadata={})
+        if len(pages) == 1:
+            r = pages[0]
+            md = r["markdown"] or r["text"] or r["html"]
+            files_dict = {"page.md": md}
+            if r.get("html"):
+                files_dict["page.html"] = r["html"]
+            return SourceBundle(
+                spec=spec, text=md, files=files_dict,
+                skill_basename=slugify(spec.url),
+                metadata={"final_url": r.get("final_url"),
+                          "method": r.get("method"), "pages_crawled": 1},
+            )
+        text_parts = []
+        files_dict = {}
+        for i, r in enumerate(pages, 1):
+            md = r.get("markdown") or r.get("text") or ""
+            url = r.get("final_url") or r.get("url") or ""
+            text_parts.append(f"\n\n===== PAGE {i}/{len(pages)} — {url} =====\n\n{md}")
+            files_dict[f"page_{i:03d}_{slugify(url)[:60]}.md"] = md
+        return SourceBundle(
+            spec=spec, text="".join(text_parts), files=files_dict,
+            skill_basename=slugify(spec.url),
+            metadata={"pages_crawled": len(pages),
+                      "page_urls": [r.get("final_url") for r in pages]},
+        )
+
+    def _bundle_pdf(self, spec):
+        path = spec.url
+        if spec.extra.get("is_url"):
+            tmp = os.path.join(self.arxiv.tmpdir, slugify(path) + ".pdf")
+            req = urllib.request.Request(path, headers={"User-Agent": DEFAULT_UA})
+            with Spinner(f"GET {path[:50]}"):
+                with urllib.request.urlopen(req, timeout=60) as r, open(tmp,"wb") as f:
+                    f.write(r.read())
+            path = tmp
+        text = ArxivFetcher._extract_pdf(path, max_pages=999)
+        return SourceBundle(
+            spec=spec, text=text, files={"document.txt": text},
+            skill_basename=slugify(Path(path).stem),
+            metadata={"pdf_path": path},
+        )
+
+    def _bundle_llms_manifest(self, spec):
+        """llms.txt is a URL manifest — fetch each listed URL (fix #7)."""
+        req = _require("requests", "pip install requests")
+        with Spinner(f"GET {spec.url}"):
+            r = req.get(spec.url, headers={"User-Agent": DEFAULT_UA}, timeout=30)
+            r.raise_for_status()
+        manifest_text = r.text
+        urls = re.findall(r'https?://[^\s\]\)>"\'<`]+', manifest_text)
+        seen = set(); unique_urls = []
+        for u in urls:
+            u = u.rstrip(".,;)")
+            if u in seen:
+                continue
+            seen.add(u); unique_urls.append(u)
+        print(f"   ✓ llms.txt: {len(unique_urls)} URLs found, fetching each")
+
+        files_dict = {"_manifest.txt": manifest_text}
+        text_parts = [f"# llms.txt manifest: {spec.url}\n\n{manifest_text}\n\n"]
+        cap = min(len(unique_urls), self.crawl_pages * 2)
+        for i, u in enumerate(unique_urls[:cap], 1):
+            try:
+                page = self.web.fetch(u)
+                md = page.get("markdown") or page.get("text") or ""
+                text_parts.append(f"\n\n===== MANIFEST ENTRY {i}/{cap} — {u} =====\n\n{md}")
+                files_dict[f"entry_{i:03d}_{slugify(u)[:60]}.md"] = md
+            except Exception as e:
+                print(f"   ⚠ {u}: {e}")
+        return SourceBundle(
+            spec=spec, text="".join(text_parts), files=files_dict,
+            skill_basename=slugify(spec.url),
+            metadata={"manifest_urls": unique_urls[:cap]},
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# LLM PROVIDER
+# ─────────────────────────────────────────────────────────────
 
 def parse_json_from_llm(text):
-    """Robustly extract JSON from LLM response."""
-    text = text.strip()
+    text = (text or "").strip()
     text = re.sub(r'^```(?:json)?\s*\n?', '', text)
     text = re.sub(r'\n?```\s*$', '', text)
     text = text.strip()
-    try: return json.loads(text)
-    except json.JSONDecodeError: pass
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
     m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
     if m:
-        try: return json.loads(m.group())
-        except json.JSONDecodeError: pass
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
     first, last = text.find('{'), text.rfind('}')
     if first != -1 and last > first:
-        try: return json.loads(text[first:last+1])
-        except json.JSONDecodeError: pass
+        try:
+            return json.loads(text[first:last+1])
+        except json.JSONDecodeError:
+            pass
     return None
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# OPENROUTER — LIVE MODEL DISCOVERY + RANKING ENGINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def clean_llm_output(text):
+    text = (text or "").strip()
+    for pfx in ("```markdown", "```md", "```yaml", "```"):
+        if text.startswith(pfx):
+            text = text[len(pfx):].strip()
+            break
+    if text.endswith("```"):
+        text = text[:-3].strip()
+    return text
 
-# Hardcoded fallback — PROVEN WORKING models, used if live API discovery fails
-OPENROUTER_FALLBACK_MODELS = [
-    "google/gemini-2.5-flash-preview:free",
-    "google/gemini-2.5-pro-exp-03-25:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "meta-llama/llama-4-maverick:free",
-    "meta-llama/llama-4-scout:free",
-    "qwen/qwen3-235b-a22b:free",
-    "google/gemma-3-27b-it:free",
-    "microsoft/phi-4-reasoning-plus:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "deepseek/deepseek-r1-0528:free",
-]
-
-# Cheap paid models — fast, reliable, pennies per paper
-# Used with --paid flag or as auto-upgrade when free pool exhausts
-OPENROUTER_PAID_MODELS = [
-    # Model ID                              # Approx cost per paper
-    "google/gemini-2.5-flash",              # ~$0.01-0.03
-    "deepseek/deepseek-chat-v3-0324",       # ~$0.01-0.02
-    "google/gemini-2.5-pro",                # ~$0.05-0.10
-    "meta-llama/llama-4-maverick",          # ~$0.02-0.05
-    "anthropic/claude-sonnet-4-20250514",   # ~$0.10-0.20
-    "openai/gpt-4.1-mini",                  # ~$0.02-0.05
-]
-
-# Quality escalation chain — sorted by extraction quality (strongest last)
-# Used when paid mode can't hit quality target with current model
-QUALITY_ESCALATION_CHAIN = [
-    # Model                                 # Quality  # Cost/paper  # When to use
-    "google/gemini-2.5-flash",              # Good      $0.01-0.03   Default paid
-    "deepseek/deepseek-chat-v3-0324",       # Good      $0.01-0.02   First escalation
-    "google/gemini-2.5-pro",                # Great     $0.05-0.10   Second escalation
-    "openai/gpt-4.1-mini",                  # Great     $0.02-0.05   Third escalation
-    "anthropic/claude-sonnet-4-20250514",   # Excellent $0.10-0.20   Fourth escalation
-    "openai/gpt-4.1",                       # Top-tier  $0.20-0.50   Nuclear option
-    "anthropic/claude-opus-4-20250514",     # Best      $0.50-1.00   Final boss
-]
-
-# Cache: avoid hitting /models every run
-_MODEL_CACHE = {"models": None, "ts": 0, "ttl": 3600}  # 1 hour TTL
-
-
-def _discover_free_models(api_key):
-    """Hit OpenRouter /api/v1/models, filter free, rank by composite score."""
-    import urllib.request, urllib.error
-
-    # Check cache
-    if _MODEL_CACHE["models"] and (time.time() - _MODEL_CACHE["ts"]) < _MODEL_CACHE["ttl"]:
-        return _MODEL_CACHE["models"]
-
-    print("   🔍 Discovering free models from OpenRouter…")
-    url = "https://openrouter.ai/api/v1/models"
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": "SkillForge/4.0",
-    })
-    try:
-        with Spinner("Fetching model registry"):
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"   ⚠ Discovery failed ({e}), using fallback pool")
-        return None
-
-    models = raw.get("data", [])
-    if not models:
-        print("   ⚠ No models returned, using fallback pool")
-        return None
-
-    # ── Filter: strict — only real text-gen chat models ──
-    # Many "free" models are vision encoders, music generators, embedding
-    # models, or overloaded behemoths that return blank. Filter aggressively.
-
-    # Blacklist: models that technically list "text" output but aren't chat models
-    BLACKLIST_PATTERNS = [
-        "lyria",           # Google's music generation model
-        "clip",            # Vision encoder, not text gen
-        "imagen",          # Image generation
-        "music",           # Music models
-        "whisper",         # Audio transcription
-        "embedding",       # Embedding models
-        "rerank",          # Reranking models
-        "tts",             # Text-to-speech
-        "stable-diffusion",# Image gen
-        "sdxl",            # Image gen
-        "flux",            # Image gen
-        "dall-e",          # Image gen
-        "moderation",      # Content moderation
-        "guard",           # Safety classifier
-        "vision-only",     # Vision-only
-        "ocr",             # OCR models
-        "jina",            # Embedding/rerank
-        "nomic",           # Embedding
-        "voyage",          # Embedding
-    ]
-
-    # Require these params — proves it's a real chat model
-    REQUIRED_PARAMS = {"temperature", "max_tokens"}
-
-    free = []
-    skipped_reasons = {"non_free": 0, "blacklisted": 0, "no_text_io": 0,
-                       "short_context": 0, "low_completion": 0, "no_chat_params": 0}
-
-    for m in models:
-        mid = m.get("id", "")
-        mid_lower = mid.lower()
-        name_lower = m.get("name", "").lower()
-        pricing = m.get("pricing", {})
-        prompt_cost = pricing.get("prompt", "1")
-        completion_cost = pricing.get("completion", "1")
-
-        # Must be free
-        if str(prompt_cost) not in ("0", "0.0", "0.00") or str(completion_cost) not in ("0", "0.0", "0.00"):
-            skipped_reasons["non_free"] += 1
-            continue
-
-        # Blacklist check — name or ID contains non-chat model keywords
-        if any(bl in mid_lower or bl in name_lower for bl in BLACKLIST_PATTERNS):
-            skipped_reasons["blacklisted"] += 1
-            continue
-
-        # Must have text input AND text output
-        arch = m.get("architecture", {})
-        in_modalities = arch.get("input_modalities", [])
-        out_modalities = arch.get("output_modalities", [])
-        if out_modalities and "text" not in out_modalities:
-            skipped_reasons["no_text_io"] += 1
-            continue
-        if in_modalities and "text" not in in_modalities:
-            skipped_reasons["no_text_io"] += 1
-            continue
-
-        # Must be text→text or text+image→text (not image→image, audio→text, etc.)
-        modality = arch.get("modality", "")
-        if modality and "text" not in modality:
-            skipped_reasons["no_text_io"] += 1
-            continue
-
-        # Must have sufficient context (≥32K — papers are big)
-        ctx = m.get("context_length", 0)
-        if ctx < 32000:
-            skipped_reasons["short_context"] += 1
-            continue
-
-        # Must support basic chat params — proves it's a real LLM
-        supported = set(m.get("supported_parameters", []))
-        if not REQUIRED_PARAMS.issubset(supported):
-            skipped_reasons["no_chat_params"] += 1
-            continue
-
-        # Must have reasonable completion cap (≥4K tokens for skill file output)
-        top_p = m.get("top_provider", {})
-        max_completion = top_p.get("max_completion_tokens") or 4096
-        if max_completion < 4000:
-            skipped_reasons["low_completion"] += 1
-            continue
-
-        free.append({
-            "id": mid,
-            "name": m.get("name", mid),
-            "context_length": ctx,
-            "max_completion": max_completion,
-            "created": m.get("created", 0),
-            "supported_params": m.get("supported_parameters", []),
-            "description": m.get("description", ""),
-        })
-
-    # Log filtering stats
-    total_skipped = sum(skipped_reasons.values())
-    print(f"   ✓ {len(models)} total → {len(free)} passed filters ({total_skipped} rejected)")
-    if not free:
-        # Show why everything got filtered
-        for reason, count in skipped_reasons.items():
-            if count: print(f"      {reason}: {count}")
-        print("   ⚠ No free models matched filters, using fallback pool")
-        return None
-
-    # ── Rank by composite SkillForge Quality Score (SQS) ──
-    ranked = _rank_models(free)
-
-    # Cache
-    _MODEL_CACHE["models"] = ranked
-    _MODEL_CACHE["ts"] = time.time()
-
-    return ranked
-
-
-def _rank_models(models):
-    """
-    SkillForge Quality Score (SQS) — speed-prioritized for free tier.
-
-    Components (weighted):
-      1. Speed Score           (30%) — smaller/faster models rank higher on free tier
-      2. Completion Cap Score  (20%) — must output full 400+ line skill files
-      3. Context Length Score  (15%) — must fit papers
-      4. Capability Score      (15%) — json_mode, system prompt support
-      5. Recency Score         (10%) — newer models extract better
-      6. Reputation Score      (10%) — known-good families boosted
-
-    On free tier, speed is king. A fast model that finishes in 30s beats a
-    slow model that takes 29 minutes but produces marginally better output.
-    """
-    if not models:
-        return []
-
-    now = time.time()
-
-    max_ctx = max(m["context_length"] for m in models)
-    max_comp = max(m["max_completion"] for m in models)
-    max_created = max(m["created"] for m in models) if any(m["created"] for m in models) else now
-    min_created = min(m["created"] for m in models if m["created"] > 0) if any(m["created"] > 0 for m in models) else now - 86400 * 365
-
-    scored = []
-    for m in models:
-        # 1. Speed Score (30%) — fast models rank highest
-        speed_score = _estimate_speed(m["id"], m["name"])
-
-        # 2. Completion Cap Score (20%)
-        comp_score = min(m["max_completion"] / max(max_comp, 1), 1.0) if max_comp > 0 else 0.5
-
-        # 3. Context Length Score (15%)
-        ctx_score = min(m["context_length"] / max(max_ctx, 1), 1.0) if max_ctx > 0 else 0.5
-
-        # 4. Capability Score (15%)
-        valuable_params = {"json_object", "response_format", "tools", "tool_choice",
-                           "temperature", "top_p", "max_tokens", "system"}
-        supported = set(m.get("supported_params", []))
-        cap_score = len(supported & valuable_params) / len(valuable_params)
-
-        # 5. Recency Score (10%)
-        if m["created"] > 0 and max_created > min_created:
-            rec_score = (m["created"] - min_created) / (max_created - min_created)
-        else:
-            rec_score = 0.5
-
-        # 6. Reputation Score (10%) — known-good model families
-        rep_score = _reputation_score(m["id"], m["name"])
-
-        # Weighted composite
-        sqs = (
-            0.30 * speed_score +
-            0.20 * comp_score +
-            0.15 * ctx_score +
-            0.15 * cap_score +
-            0.10 * rec_score +
-            0.10 * rep_score
-        ) * 100
-
-        scored.append({**m, "sqs": round(sqs, 1),
-                       "_scores": {
-                           "spd": round(speed_score, 2), "comp": round(comp_score, 2),
-                           "ctx": round(ctx_score, 2), "cap": round(cap_score, 2),
-                           "rec": round(rec_score, 2), "rep": round(rep_score, 2),
-                       }})
-
-    scored.sort(key=lambda x: x["sqs"], reverse=True)
-    return scored
-
-
-def _estimate_speed(model_id, name):
-    """Estimate inference speed on free tier. Returns [0, 1]. Higher = faster.
-
-    On free tier, speed correlates inversely with model size and directly
-    with provider infrastructure. Known-fast models get high scores."""
-    text = f"{model_id} {name}".lower()
-
-    # ── Tier 1: Known fast on free tier (0.85-1.0) ──
-    fast_patterns = {
-        "gemini-2.5-flash": 0.95,   # Google infra, flash = optimized for speed
-        "gemini-2.0-flash": 0.93,
-        "gemini-flash":     0.90,
-        "gemma-3-12b":      0.88,   # Small model, fast
-        "gemma-3-4b":       0.92,   # Very small, very fast
-        "gemma-4":          0.85,
-        "phi-4":            0.88,   # Small Microsoft model
-        "phi-3":            0.88,
-        "llama-4-scout":    0.82,   # Smaller llama variant
-        "mistral-small":    0.87,   # Optimized for speed
-    }
-    for pattern, score in fast_patterns.items():
-        if pattern in text:
-            return score
-
-    # ── Tier 2: Medium speed (0.55-0.80) ──
-    medium_patterns = {
-        "deepseek-chat-v3":   0.75,  # Good infra but large
-        "deepseek-chat":      0.72,
-        "llama-4-maverick":   0.70,  # Larger llama
-        "llama-3.3-70b":      0.65,
-        "qwen-2.5-72b":       0.60,
-        "gemma-3-27b":        0.68,
-        "gemini-2.5-pro":     0.65,  # Pro = larger, slower than flash
-        "glm-4":              0.60,
-    }
-    for pattern, score in medium_patterns.items():
-        if pattern in text:
-            return score
-
-    # ── Tier 3: Known slow on free tier (0.1-0.45) ──
-    slow_patterns = {
-        "minimax":           0.15,   # Empirically 29 min per chunk
-        "nemotron-120b":     0.20,   # Huge model, overloaded free
-        "nemotron":          0.30,
-        "qwen3-235b":        0.25,   # 235B params, crawls on free
-        "qwen3-coder":       0.35,   # Large coder model
-        "deepseek-r1":       0.30,   # Reasoning model = very slow
-        "hermes-3-llama-3.1-405b": 0.20,  # 405B = glacier
-        "405b":              0.15,
-    }
-    for pattern, score in slow_patterns.items():
-        if pattern in text:
-            return score
-
-    # ── Infer from parameter count ──
-    matches = re.findall(r'(\d+\.?\d*)\s*b', text)
-    if matches:
-        params_b = max(float(m) for m in matches)
-        # Inverse: smaller = faster. 3B=0.90, 12B=0.75, 70B=0.45, 405B=0.15
-        if params_b <= 3:    return 0.90
-        if params_b <= 12:   return 0.78
-        if params_b <= 30:   return 0.65
-        if params_b <= 80:   return 0.45
-        if params_b <= 200:  return 0.30
-        return 0.15
-
-    # MoE: use active params, not total
-    moe = re.findall(r'(\d+)b.*?a(\d+)b', text)
-    if moe:
-        active = float(moe[0][1])
-        if active <= 12:  return 0.80
-        if active <= 30:  return 0.65
-        return 0.45
-
-    return 0.50  # unknown
-
-
-def _reputation_score(model_id, name):
-    """Score based on known extraction quality for SkillForge's use case.
-    Returns [0, 1]. Based on empirical results from real runs."""
-    text = f"{model_id} {name}".lower()
-
-    # Proven excellent for document extraction
-    excellent = ["gemini-2.5-flash", "gemini-2.5-pro", "deepseek-chat-v3",
-                 "claude", "gpt-4"]
-    if any(k in text for k in excellent):
-        return 0.95
-
-    # Known good
-    good = ["llama-4", "gemma-3-27b", "gemma-4", "qwen-2.5-72b",
-            "phi-4", "mistral-small"]
-    if any(k in text for k in good):
-        return 0.75
-
-    # Known mediocre for extraction (good at code, bad at papers)
-    mediocre = ["qwen3-coder", "deepseek-r1", "deepseek-coder"]
-    if any(k in text for k in mediocre):
-        return 0.40
-
-    # Known problematic on free tier
-    bad = ["minimax", "nemotron", "hermes-3"]
-    if any(k in text for k in bad):
-        return 0.20
-
-    return 0.55  # unknown
-
-
-def _print_model_rankings(models, top_n=8):
-    """Print ranked model table to terminal."""
-    show = models[:top_n]
-    max_name = min(max(len(m["id"].split("/")[-1]) for m in show), 35)
-
-    print(f"   ┌─{'─'*3}─┬─{'─'*max_name}─┬─{'─'*5}─┬─{'─'*8}─┬─{'─'*8}─┬─{'─'*5}─┐")
-    print(f"   │ {'#':>3} │ {'Model':<{max_name}} │ {'SQS':>5} │ {'Context':>8} │ {'MaxComp':>8} │ {'Speed':>5} │")
-    print(f"   ├─{'─'*3}─┼─{'─'*max_name}─┼─{'─'*5}─┼─{'─'*8}─┼─{'─'*8}─┼─{'─'*5}─┤")
-
-    for i, m in enumerate(show):
-        short = m["id"].split("/")[-1][:max_name]
-        ctx_k = f"{m['context_length']//1000}K"
-        comp_k = f"{m['max_completion']//1000}K"
-        spd = m["_scores"]["spd"]
-        marker = " ◄" if i == 0 else ""
-        print(f"   │ {i+1:>3} │ {short:<{max_name}} │ {m['sqs']:>5} │ {ctx_k:>8} │ {comp_k:>8} │ {spd:>5} │{marker}")
-
-    print(f"   └─{'─'*3}─┴─{'─'*max_name}─┴─{'─'*5}─┴─{'─'*8}─┴─{'─'*8}─┴─{'─'*5}─┘")
-
-    if len(models) > top_n:
-        print(f"   … +{len(models)-top_n} more models in fallback pool")
-
-
-def _build_model_pool(api_key, user_model=None):
-    """Discover, rank, and return ordered model ID list."""
-    ranked = _discover_free_models(api_key)
-
-    if ranked:
-        print(f"   ✓ Found {len(ranked)} free models, ranked by SQS:")
-        _print_model_rankings(ranked)
-        pool = [m["id"] for m in ranked]
-    else:
-        print(f"   ⚠ Using hardcoded fallback pool ({len(OPENROUTER_FALLBACK_MODELS)} models)")
-        pool = list(OPENROUTER_FALLBACK_MODELS)
-
-    # If user specified a model, put it first
-    if user_model:
-        pool = [user_model] + [m for m in pool if m != user_model]
-
-    return pool
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# LLM PROVIDER — v4: openrouter + agentic model rotation
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class LLMProvider:
-    def __init__(self, provider="anthropic", model=None, api_key=None, paid=False):
+    def __init__(self, provider="gemini", model=None, api_key=None):
         self.provider = provider
-        self._paid = paid  # OpenRouter: use paid models
         if provider == "anthropic":
-            mod = _require_anthropic()
+            anthropic = _require("anthropic", "pip install anthropic")
             self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-            if not self.api_key: print("❌ Set ANTHROPIC_API_KEY"); sys.exit(1)
-            self.client = mod.Anthropic(api_key=self.api_key)
+            if not self.api_key:
+                print("❌ Set ANTHROPIC_API_KEY"); sys.exit(1)
+            self.client = anthropic.Anthropic(api_key=self.api_key)
             self.model = model or "claude-sonnet-4-20250514"
         elif provider == "gemini":
-            genai = _require_gemini()
-            self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-            if not self.api_key: print("❌ Set GEMINI_API_KEY"); sys.exit(1)
+            genai = _require("google.generativeai", "pip install google-generativeai")
+            self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if not self.api_key:
+                print("❌ Set GEMINI_API_KEY"); sys.exit(1)
             genai.configure(api_key=self.api_key)
-            self.model = model or "gemini-2.5-pro"
             self._genai = genai
+            self.model = model or "gemini-2.5-flash"
         elif provider == "openrouter":
-            openai = _require_openai()
+            openai = _require("openai", "pip install openai")
             self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-            if not self.api_key: print("❌ Set OPENROUTER_API_KEY"); sys.exit(1)
-            self.client = openai.OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=self.api_key,
-            )
-            # Build model pool
-            if paid:
-                # Paid mode: use cheap paid models directly
-                self._model_pool = list(OPENROUTER_PAID_MODELS)
-                if model:
-                    self._model_pool = [model] + [m for m in self._model_pool if m != model]
-                self._free_exhausted = True  # skip free tier
-            else:
-                # Free mode: discover + rank free models, paid as fallback
-                self._model_pool = _build_model_pool(self.api_key, model)
-                self._free_exhausted = False
-            self._exhausted = set()
-            self._current_idx = 0
-            self.model = self._model_pool[0]
-            self._call_count = 0
-            self._rotations = 0
-            _or_banner(self.model, len(self._model_pool), paid)
+            if not self.api_key:
+                print("❌ Set OPENROUTER_API_KEY"); sys.exit(1)
+            self.client = openai.OpenAI(base_url="https://openrouter.ai/api/v1",
+                                        api_key=self.api_key)
+            self.model = model or "google/gemini-2.5-flash"
         else:
             print(f"❌ Unknown provider: {provider}"); sys.exit(1)
 
-    # ── OpenRouter model rotation ──
-
-    def _rotate_model(self, failed_model, reason="rate_limit"):
-        """Rotate to next available model. Auto-upgrades to paid if free pool exhausts."""
-        self._exhausted.add(failed_model)
-        available = [m for m in self._model_pool if m not in self._exhausted]
-
-        # If free pool exhausted, auto-upgrade to paid
-        if not available and not self._free_exhausted and not self._paid:
-            self._free_exhausted = True
-            print(f"   {'─'*50}")
-            print(f"   💰 Free pool exhausted — upgrading to paid models")
-            print(f"   ├─ Adding {len(OPENROUTER_PAID_MODELS)} cheap paid models")
-            print(f"   └─ Estimated cost: $0.01-0.10 per paper")
-            print(f"   {'─'*50}")
-            for pm in OPENROUTER_PAID_MODELS:
-                if pm not in self._model_pool:
-                    self._model_pool.append(pm)
-            available = [m for m in self._model_pool if m not in self._exhausted]
-
-        if not available:
-            print(f"   {'─'*50}")
-            print(f"   ❌ All {len(self._model_pool)} models exhausted (free + paid).")
-            print(f"   💡 Wait 60s for rate limits to reset, or use --provider anthropic")
-            print(f"   {'─'*50}")
-            return False
-
-        old_short = failed_model.split("/")[-1][:30]
-        self.model = available[0]
-        self._current_idx = self._model_pool.index(self.model)
-        self._rotations += 1
-        new_short = self.model.split("/")[-1][:30]
-        remaining = len(available) - 1
-        # Look up SQS if available from cache
-        sqs_str = ""
-        if _MODEL_CACHE["models"]:
-            for cm in _MODEL_CACHE["models"]:
-                if cm["id"] == self.model:
-                    sqs_str = f" (SQS: {cm['sqs']})"
-                    break
-        # Check if this is a paid model
-        is_paid = self.model in OPENROUTER_PAID_MODELS or ":free" not in self.model
-        tier = " 💰" if is_paid else ""
-        # Elegant terminal output
-        print(f"   {'─'*50}")
-        print(f"   🔄 Model rotation #{self._rotations}")
-        print(f"   ├─ ✗ {old_short} → {reason}")
-        print(f"   ├─ ✓ {new_short}{sqs_str}{tier}")
-        print(f"   └─ {remaining} fallback{'s' if remaining != 1 else ''} remaining")
-        print(f"   {'─'*50}")
-        return True
-
-    def _is_rate_limit(self, error):
-        """Detect rate limit and spend limit errors across providers."""
-        s = str(error).lower()
-        return any(k in s for k in [
-            "429", "402", "rate_limit", "rate limit", "resource_exhausted",
-            "quota", "too many requests", "requests per minute",
-            "capacity", "overloaded", "try again",
-            "spend limit", "spending limit", "balance",
-        ])
-
-    def _is_permission_error(self, error):
-        s = str(error).lower()
-        return any(k in s for k in ["403", "permission_denied", "denied access", "forbidden"])
-
-    def _is_context_length_error(self, error):
-        s = str(error).lower()
-        return any(k in s for k in ["context_length", "too long", "maximum context", "token limit"])
-
-    def escalate_for_quality(self, current_score, target_score):
-        """Escalate to a stronger model when quality target isn't met.
-        Only works in paid openrouter mode. Returns True if escalation happened."""
-        if self.provider != "openrouter" or not self._paid:
-            return False
-
-        # Find current model's position in escalation chain
-        current = self.model
-        chain = QUALITY_ESCALATION_CHAIN
-
-        # Find next stronger model
-        current_idx = -1
-        for i, m in enumerate(chain):
-            if m == current:
-                current_idx = i
-                break
-
-        # If current model isn't in chain, start from after the first one
-        if current_idx == -1:
-            current_idx = 0
-
-        # Try next model in chain
-        next_idx = current_idx + 1
-        if next_idx >= len(chain):
-            print(f"   {'─'*50}")
-            print(f"   ❌ Already on strongest model ({current.split('/')[-1]})")
-            print(f"   └─ Score {current_score}/10 is the best achievable")
-            print(f"   {'─'*50}")
-            return False
-
-        old_short = current.split("/")[-1][:30]
-        new_model = chain[next_idx]
-        new_short = new_model.split("/")[-1][:30]
-        remaining = len(chain) - next_idx - 1
-
-        print(f"   {'─'*50}")
-        print(f"   ⬆ Quality escalation ({current_score}/{target_score} not met)")
-        print(f"   ├─ ✗ {old_short} → scored {current_score}/10")
-        print(f"   ├─ ✓ {new_short} (stronger model)")
-        print(f"   └─ {remaining} escalation{'s' if remaining != 1 else ''} remaining")
-        print(f"   {'─'*50}")
-
-        self.model = new_model
-        return True
-
-    # ── Main generate with rotation ──
-
     def generate(self, system_prompt, user_message, max_tokens=16000, json_mode=False):
-        """Generate with retry, model rotation on rate limits, and safety filter handling."""
-        max_attempts = len(self._model_pool) + 2 if self.provider == "openrouter" else 3
-
-        for attempt in range(max_attempts):
+        for attempt in range(3):
             try:
-                result = self._generate_inner(system_prompt, user_message, max_tokens, json_mode)
-                if self.provider == "openrouter":
-                    self._call_count += 1
-                return result
+                return self._generate_inner(system_prompt, user_message,
+                                            max_tokens, json_mode)
             except Exception as e:
-                err_str = str(e).lower()
-
-                # ── OpenRouter: rotate on rate limit ──
-                if self.provider == "openrouter" and self._is_rate_limit(e):
-                    if self._rotate_model(self.model, "rate_limit"):
-                        continue
-                    else:
-                        # All exhausted — wait and reset
-                        print(f"   ⏳ All models exhausted. Waiting 60s for reset…")
-                        time.sleep(60)
-                        self._exhausted.clear()
-                        self.model = self._model_pool[0]
-                        print(f"   🔄 Pool reset. Retrying with {self.model.split('/')[-1][:30]}")
-                        continue
-
-                # ── OpenRouter: rotate on permission denied ──
-                if self.provider == "openrouter" and self._is_permission_error(e):
-                    if self._rotate_model(self.model, "permission_denied"):
-                        continue
-                    return ""
-
-                # ── OpenRouter: rotate on context length ──
-                if self.provider == "openrouter" and self._is_context_length_error(e):
-                    if self._rotate_model(self.model, "context_too_long"):
-                        continue
-                    return ""
-
-                # ── OpenRouter: rotate on empty/blank response ──
-                if self.provider == "openrouter" and ("empty response" in err_str or "blank content" in err_str):
-                    if self._rotate_model(self.model, "empty_response"):
-                        continue
-                    return ""
-
-                # ── Non-OpenRouter rate limit ──
-                if self._is_rate_limit(e):
-                    wait = (attempt + 1) * 30
-                    print(f"   ⏳ Rate limited, waiting {wait}s (attempt {attempt+1}/3)…")
+                msg = str(e).lower()
+                if any(k in msg for k in ("429","rate","quota","resource_exhausted")):
+                    wait = (attempt + 1) * 20
+                    print(f"   ⏳ Rate limited, waiting {wait}s")
                     time.sleep(wait)
                     continue
-
-                # ── Safety filter ──
-                if "finish_reason" in err_str or "valid `part`" in err_str:
-                    print(f"   ⚠ Safety filter triggered, returning empty")
+                if "finish_reason" in msg or "valid `part`" in msg:
+                    print("   ⚠ Safety filter, returning empty")
                     return ""
-
-                # ── Unknown error ──
+                if attempt < 2:
+                    print(f"   ⚠ LLM error: {e}; retrying")
+                    time.sleep(5)
+                    continue
                 raise
-
-        print("   ❌ Max retries exceeded")
         return ""
 
-    def _generate_inner(self, system_prompt, user_message, max_tokens, json_mode=False):
+    def _generate_inner(self, system_prompt, user_message, max_tokens, json_mode):
         if self.provider == "anthropic":
-            with Spinner(f"Generating via {self.model.split('/')[-1][:25]}"):
-                msg = self.client.messages.create(
+            with Spinner(f"Anthropic {self.model[:25]}"):
+                m = self.client.messages.create(
                     model=self.model, max_tokens=max_tokens,
                     system=system_prompt,
-                    messages=[{"role": "user", "content": user_message}],
+                    messages=[{"role":"user","content":user_message}],
                 )
-            print(f"   [{self.provider}] {msg.usage.input_tokens:,} in / {msg.usage.output_tokens:,} out")
-            return msg.content[0].text
+            print(f"   [{self.provider}] {m.usage.input_tokens:,} in / {m.usage.output_tokens:,} out")
+            return m.content[0].text
 
-        elif self.provider == "gemini":
+        if self.provider == "gemini":
             gm = self._genai.GenerativeModel(self.model, system_instruction=system_prompt)
-            gen_config = {"max_output_tokens": max_tokens, "temperature": 0.2}
+            cfg = {"max_output_tokens": max_tokens, "temperature": 0.2}
             if json_mode:
-                gen_config["response_mime_type"] = "application/json"
-            with Spinner(f"Generating via {self.model}"):
+                cfg["response_mime_type"] = "application/json"
+            with Spinner(f"Gemini {self.model}"):
                 try:
                     resp = gm.generate_content(
                         user_message,
-                        generation_config=self._genai.types.GenerationConfig(**gen_config),
+                        generation_config=self._genai.types.GenerationConfig(**cfg),
                     )
                 except TypeError:
-                    gen_config.pop("response_mime_type", None)
+                    cfg.pop("response_mime_type", None)
                     resp = gm.generate_content(
                         user_message,
-                        generation_config=self._genai.types.GenerationConfig(**gen_config),
+                        generation_config=self._genai.types.GenerationConfig(**cfg),
                     )
-            # Check for safety block before accessing .text
             if not resp.candidates or not resp.candidates[0].content.parts:
-                fr = resp.candidates[0].finish_reason if resp.candidates else "unknown"
-                print(f"   ⚠ Gemini returned no content (finish_reason={fr})")
+                fr = resp.candidates[0].finish_reason if resp.candidates else "?"
+                print(f"   ⚠ Gemini empty (finish_reason={fr})")
                 return ""
-            result = resp.text
-            try:
-                print(f"   [{self.provider}] {resp.usage_metadata.prompt_token_count:,} in / {resp.usage_metadata.candidates_token_count:,} out")
-            except: print(f"   [{self.provider}] {len(result)} chars")
-            return result
+            return resp.text
 
-        elif self.provider == "openrouter":
-            model_short = self.model.split("/")[-1][:25]
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ]
-            kwargs = {
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-            }
+        if self.provider == "openrouter":
+            kwargs = dict(model=self.model,
+                          messages=[{"role":"system","content":system_prompt},
+                                    {"role":"user","content":user_message}],
+                          max_tokens=max_tokens, temperature=0.2)
             if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-
-            with Spinner(f"Generating via {model_short}"):
+                kwargs["response_format"] = {"type":"json_object"}
+            with Spinner(f"OpenRouter {self.model.split('/')[-1][:25]}"):
                 resp = self.client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+        return ""
 
-            # Guard against None responses
-            if not resp or not resp.choices or not resp.choices[0].message:
-                print(f"   ⚠ {model_short} returned empty response")
-                raise RuntimeError(f"Empty response from {self.model} — rotating")
-            text = resp.choices[0].message.content or ""
-            if not text.strip():
-                print(f"   ⚠ {model_short} returned blank content")
-                raise RuntimeError(f"Blank content from {self.model} — rotating")
-            # Token logging
-            if resp.usage:
-                print(f"   [openrouter/{model_short}] {resp.usage.prompt_tokens:,} in / {resp.usage.completion_tokens:,} out")
+
+# ─────────────────────────────────────────────────────────────
+# PROMPTS + SMART TRUNCATION
+# ─────────────────────────────────────────────────────────────
+
+REPO_SYSTEM_PROMPT = r"""You are SkillForge, generating a SKILL.md from a GitHub repository.
+
+CRITICAL RULES (DO NOT VIOLATE):
+1. Use ONLY information present in the source dump below. NEVER guess values.
+2. If a value (a number, hyperparameter, version, benchmark, framework, API
+   shape) is not explicitly stated in the source, say "not specified in
+   source" — do NOT invent it.
+3. Reproduce file paths, class names, function names, and constants VERBATIM.
+4. When you quote code, use exact lines from the dump.
+5. Tables must contain ONLY numbers that appear in the source.
+
+OUTPUT FORMAT:
+---
+name: <kebab-case-id>
+description: <120-180 words with explicit trigger phrases for when to use it. Use ONLY facts from the source.>
+---
+
+# <Project name from README>
+
+## 1. What it does
+2-4 paragraphs describing what is in the repo, using its own README/docs.
+
+## 2. Architecture
+Component table: Component | File | Purpose
+Use ONLY components present in the source.
+
+## 3. Key files
+For each important file, summary based on actual contents.
+
+## 4. APIs / Functions / Classes
+List public surface verbatim from the code.
+
+## 5. Configuration
+Hyperparameters / env vars / config keys with actual values from source.
+
+## 6. Dependencies
+Versions from requirements / package manifest.
+
+## 7. Usage
+Reproduce usage from README; do not invent.
+
+## 8. References
+Links found in the repo.
+
+DO NOT wrap in code fences. DO NOT invent metrics."""
+
+
+WEB_SYSTEM_PROMPT = r"""You are SkillForge, generating a SKILL.md from documentation pages.
+
+CRITICAL RULES:
+1. Use ONLY information present in the page content below. NEVER guess.
+2. If something is not stated, say "not specified on the source pages".
+3. Reproduce identifiers, URLs, and code blocks verbatim.
+4. If multiple pages are provided, integrate them — do not just summarize one.
+
+OUTPUT FORMAT:
+---
+name: <kebab-case>
+description: <120-180 words, trigger-phrase heavy. Use only facts present on the pages.>
+---
+
+# <page or product title>
+
+Organize the SKILL by the concepts that ACTUALLY appear on the pages. Include
+tables, code blocks, and examples verbatim.
+
+DO NOT wrap in code fences. DO NOT invent."""
+
+
+PAPER_SYSTEM_PROMPT = r"""You are SkillForge, generating a SKILL.md from a research paper.
+
+CRITICAL RULES:
+1. Use ONLY information stated in the paper.
+2. Reproduce every equation, table, and benchmark number EXACTLY as printed.
+3. Do not invent author names, citations, or results.
+
+Sections: paper metadata, problem setup, method, equations, algorithm,
+experiments (full tables), results (verbatim numbers), key takeaways,
+references.
+
+DO NOT wrap in code fences. DO NOT invent."""
+
+
+REPAIR_SYSTEM_PROMPT = r"""You are SkillForge's repair agent.
+
+A skill file you previously produced contains UNVERIFIED CLAIMS that do not
+appear in the downloaded source. Your job is to fix this — and ONLY this.
+
+REQUIRED ACTIONS:
+1. For each line listed below as "Unverified", you must EITHER:
+   a) Delete the line / the offending claim entirely, OR
+   b) Replace the unverified value with the correct value FROM THE SOURCE.
+2. Do NOT invent replacements. If no source-grounded replacement exists,
+   delete.
+3. Preserve all VERIFIED content. Keep the same YAML frontmatter, headings,
+   and overall structure.
+4. Output the COMPLETE corrected skill file. Not a diff. Not patches.
+5. Do NOT wrap output in code fences."""
+
+
+def _system_prompt_for(kind):
+    if kind in ("arxiv","pdf"):
+        return PAPER_SYSTEM_PROMPT
+    if kind in ("github_repo","github_blob","github_pr"):
+        return REPO_SYSTEM_PROMPT
+    return WEB_SYSTEM_PROMPT
+
+
+def smart_truncate_for_llm(bundle, budget_chars):
+    """Priority-ordered truncation (fix #12)."""
+    if len(bundle.text) <= budget_chars:
+        return bundle.text
+
+    kind = bundle.spec.kind
+
+    if kind in ("github_repo","github_blob","github_pr","github_org"):
+        # Files were priority-sorted in _walk. Keep the header + as many
+        # priority-ordered sections as fit, drop the rest.
+        m = re.search(r'\n## File contents \(priority-ordered\)\n', bundle.text)
+        if not m:
+            return _head_tail_truncate(bundle.text, budget_chars)
+        header = bundle.text[: m.end()]
+        body = bundle.text[m.end():]
+        sections = re.split(r'(?=^### `)', body, flags=re.MULTILINE)
+        kept = []
+        used = len(header)
+        dropped = 0
+        for sec in sections:
+            slen = len(sec)
+            if used + slen <= budget_chars - 500:
+                kept.append(sec)
+                used += slen
             else:
-                print(f"   [openrouter/{model_short}] {len(text)} chars")
-            return text
-
-    def generate_multi_turn(self, system_prompt, messages, max_tokens=16000):
-        if self.provider == "anthropic":
-            msg = self.client.messages.create(
-                model=self.model, max_tokens=max_tokens,
-                system=system_prompt, messages=messages,
-            )
-            print(f"   [{self.provider}] {msg.usage.input_tokens:,} in / {msg.usage.output_tokens:,} out")
-            return msg.content[0].text
-        elif self.provider == "gemini":
-            gm = self._genai.GenerativeModel(self.model, system_instruction=system_prompt)
-            chat = gm.start_chat()
-            result = None
-            for m in messages:
-                if m["role"] == "assistant":
-                    chat.history.append({"role": "model", "parts": [m["content"]]})
-                else:
-                    try:
-                        resp = chat.send_message(
-                            m["content"],
-                            generation_config=self._genai.types.GenerationConfig(
-                                max_output_tokens=max_tokens, temperature=0.2,
-                            ),
-                        )
-                        result = resp.text
-                    except Exception as e:
-                        if "finish_reason" in str(e).lower() or "valid `part`" in str(e).lower():
-                            print(f"   ⚠ Safety filter in multi-turn, returning partial")
-                            return result or ""
-                        raise
-            return result or ""
-        elif self.provider == "openrouter":
-            # Build full conversation for OpenRouter
-            api_messages = [{"role": "system", "content": system_prompt}]
-            for m in messages:
-                api_messages.append({
-                    "role": m["role"] if m["role"] != "assistant" else "assistant",
-                    "content": m["content"],
-                })
-            model_short = self.model.split("/")[-1][:25]
-            # Use same rotation-aware generate path
-            for attempt in range(len(self._model_pool) + 2):
-                try:
-                    with Spinner(f"Multi-turn via {model_short}"):
-                        resp = self.client.chat.completions.create(
-                            model=self.model,
-                            messages=api_messages,
-                            max_tokens=max_tokens,
-                            temperature=0.2,
-                        )
-                    if not resp or not resp.choices or not resp.choices[0].message:
-                        raise RuntimeError(f"Empty response from {self.model}")
-                    text = resp.choices[0].message.content or ""
-                    if not text.strip():
-                        raise RuntimeError(f"Blank content from {self.model}")
-                    if resp.usage:
-                        print(f"   [openrouter/{model_short}] {resp.usage.prompt_tokens:,} in / {resp.usage.completion_tokens:,} out")
-                    else:
-                        print(f"   [openrouter/{model_short}] {len(text)} chars")
-                    self._call_count += 1
-                    return text
-                except Exception as e:
-                    if self._is_rate_limit(e) or "empty response" in str(e).lower() or "blank content" in str(e).lower():
-                        if self._rotate_model(self.model, "rate_limit"):
-                            model_short = self.model.split("/")[-1][:25]
-                            continue
-                    raise
-            return ""
-
-
-def _or_banner(model, pool_size, paid=False):
-    """Print OpenRouter startup banner with SQS."""
-    short = model.split("/")[-1][:35]
-    sqs = "—"
-    if _MODEL_CACHE["models"]:
-        for cm in _MODEL_CACHE["models"]:
-            if cm["id"] == model:
-                sqs = f"{cm['sqs']}/100"
-                break
-    source = "live API" if _MODEL_CACHE["models"] else "fallback"
-    mode = "paid (fast)" if paid else "free → paid fallback"
-    cost = "~$0.01-0.10/paper" if paid else "$0 (auto-upgrades if needed)"
-    print(f"   ┌{'─'*52}┐")
-    print(f"   │ {'🌐 OpenRouter — Agentic Model Routing':^50} │")
-    print(f"   ├{'─'*52}┤")
-    print(f"   │ {'Primary:':<12} {short:<38} │")
-    print(f"   │ {'SQS:':<12} {sqs:<38} │")
-    print(f"   │ {'Pool:':<12} {f'{pool_size} models ({source})':<38} │")
-    print(f"   │ {'Mode:':<12} {mode:<38} │")
-    print(f"   │ {'Rotation:':<12} {'automatic on rate limit':<38} │")
-    print(f"   │ {'Cost:':<12} {cost:<38} │")
-    print(f"   └{'─'*52}┘")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SYSTEM PROMPTS — v3
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-CHUNK_EXTRACTION_PROMPT = r"""You are SkillForge, extracting implementation-critical content from a SECTION of a research paper.
-
-Extract EVERYTHING from this section. Your output will be merged with other sections — anything you skip is LOST FOREVER.
-
-MANDATORY CHECKLIST — extract ALL that appear:
-
-□ Every equation/formula with ALL variable definitions
-□ Every table — reproduce completely in markdown with ALL rows and columns
-□ Every algorithm/pseudocode — reproduce verbatim
-□ Every architecture detail — layer counts, dimensions, channel sizes, activations
-□ Every hyperparameter — learning rates, batch sizes, optimizers, schedules, warmup
-□ Every experimental result — accuracy, perplexity, loss values, speedups with numbers
-□ Every hardware/efficiency measurement — energy (pJ), area (μm²), latency, throughput
-□ Every comparison table — model vs model with actual numbers
-□ Every initialization scheme — distributions, scale factors
-□ Every loss function — full formula with all terms and weights
-□ Every known failure mode, bug, edge case, caveat
-□ Every dependency/library/framework mentioned
-
-Write equations as:
-```
-Equation N: [description]
-Q(r) = Int(r/S) - Z
-where: r = real-valued input, S = scaling factor, Z = zero point
-```
-
-DO NOT summarize. Extract SPECIFIC methods with SPECIFIC details.
-
-SECTION TEXT:
-"""
-
-PAPER_SYSTEM_PROMPT = r"""You are SkillForge, producing the FINAL merged SKILL.md from partial extractions of a research paper.
-
-QUALITY TARGET: 400-600 lines. Under 350 = dropping critical content.
-
-MANDATORY CONTENT:
-1. YAML frontmatter with name + trigger-heavy description (100-150 words)
-2. Paper metadata (all authors, affiliation, venue, year)
-3. EVERY equation — numbered, all variable definitions
-4. EVERY results/comparison table — ALL rows and numbers
-5. EVERY algorithm/pseudocode — complete
-6. ALL hyperparameters in dedicated section/table
-7. ALL architecture details with exact dimensions
-8. ALL hardware efficiency data in tables
-9. ALL known failure modes, caveats
-10. 8-12 implementation takeaways
-11. Key references section
-
-FORMAT:
----
-name: [kebab-case]
-description: [100-150 words, trigger-heavy, include "Use this skill when..." with 4+ scenarios]
----
-# [Title]
-**Paper**: [Authors] ([Affiliations])
-**Published**: [Venue, Year]
-**Key result**: [One-line with specific numbers]
----
-## 1. Problem Setup and Notation
-## 2-N. [Core sections]
-## N+1. Experimental Results [COMPLETE tables]
-## N+2. Hardware/Efficiency Data [tables]
-## N+3. Key Takeaways (8-12 items)
-## N+4. References
-
-RULES:
-1. NEVER skip an equation
-2. NEVER summarize a table — REPRODUCE with numbers
-3. NEVER say "various methods" — NAME each with details
-4. Deduplicate keeping MORE detailed version
-5. DO NOT wrap in code fences
-
-{domain_context}"""
-
-
-GITHUB_SYSTEM_PROMPT = r"""You are SkillForge, creating a SKILL.md for a GitHub repository.
-
-QUALITY TARGET: 400-700 lines.
-
-## TASK
-Analyze the source code dump EXHAUSTIVELY. Extract ALL implementation details.
-
-## CRITICAL ADDITIONS FOR v3
-When code references formulas from papers (in comments, docstrings, or variable names):
-- WRITE OUT the full mathematical formula, not just "implements equation (4) from [paper]"
-- If a loss function is computed in code, write both the CODE and the MATH formula it implements
-- If a paper is referenced (arXiv ID, citation), note the paper and what concept is borrowed
-
-When README or configs mention benchmark results:
-- REPRODUCE them in a table (training loss, validation perplexity, comparison vs baselines)
-- Include hardware specs, training time, GPU requirements
-
-## OUTPUT FORMAT
-
-### YAML Frontmatter
----
-name: <id>
-description: <100-150 words with triggers>
----
-
-### Sections (ALL required):
-
-**1. What It Does** — 2-4 paragraphs, key insight/novelty
-
-**2. Architecture Overview**
-- 2.1 Component Summary TABLE: Component | Class/Module | Purpose
-- 2.2 Pipeline Flow — ASCII art with data shapes
-
-**3-N. Detailed Code Analysis** — per major module:
-- Class __init__ with annotated params (types, defaults, what each does)
-- forward() with exact input/output tensor shapes
-- Config values as tables (dimensions, channels, hidden sizes)
-- Important patterns with annotated code snippets
-- Loss functions: BOTH the code AND the math formula they implement
-
-**N+1. Mathematical Foundations**
-- Every formula referenced or implemented in the code
-- Written as equations with variable definitions
-- Cross-referenced to the code that implements them
-
-**N+2. Training Configuration**
-- ALL hyperparameters from config files in a table
-- Optimizer, LR schedule, batch size, warmup, total steps/tokens
-
-**N+3. Benchmark Results**
-- Training/validation loss or perplexity from README or logs
-- Comparison vs baselines (e.g., GPT-2 val loss vs this model's)
-- Hardware requirements and training time
-
-**N+4. Pretrained Models** — Table: Model | Source | Download | Performance
-
-**N+5. Dependencies** — exact versions, known conflicts
-
-**N+6. Adaptation & Reuse Patterns** — what's reusable, how to adapt
-
-## RULES
-1. Don't guess — say "unclear from source" if unsure
-2. Extract EXACT numbers from code/configs
-3. Show annotated code snippets (strip boilerplate)
-4. When code computes a loss/metric, write the MATH formula it implements
-5. Tables for ALL structured info
-6. DO NOT wrap output in code fences
-
-{domain_context}"""
-
-
-GAP_FIX_PROMPT = r"""You are SkillForge's agentic repair pass. A skill file was generated but scored poorly on validation.
-
-VALIDATION RESULT:
-Score: {score}/10
-Gaps identified:
-{gaps}
-
-YOUR TASK: Fix ALL identified gaps. You have the current skill file and the original source content.
-
-RULES:
-1. Output the COMPLETE corrected skill file (not a diff, not patches)
-2. Keep everything that was already correct
-3. ADD the missing content identified in the gaps
-4. If a gap says "missing mathematics" — find and write out the specific equations
-5. If a gap says "missing numbers/results" — find and add the specific tables/benchmarks
-6. Maintain the same YAML frontmatter and overall structure
-7. DO NOT wrap output in code fences
-
-CURRENT SKILL FILE:
-{skill_content}
-
-ORIGINAL SOURCE:
-{source_excerpt}
-
-Output the COMPLETE corrected SKILL.md:"""
-
-
-VALIDATION_PROMPT = """Review this skill file for completeness (1-10 scale).
-
-Check:
-1. MISSING MATH: Equations referenced but not written?
-2. MISSING RESULTS: Benchmarks mentioned but not tabulated?
-3. VAGUE CONTENT: "various methods" without specifics?
-4. IMPLEMENTATION GAPS: Could an LLM implement using ONLY this?
-5. MISSING CONFIG: Hyperparameters not listed?
-
-Skill file (excerpt):
-{skill_content}
-
-Respond with ONLY valid JSON. No fences. No explanation:
-{{"score": <1-10>, "gaps": ["gap1", "gap2"], "suggested_additions": ["add1"], "is_production_ready": true}}"""
-
-
-ENRICHMENT_PROMPT = r"""Find MISSING content that should be in the skill file but isn't.
-
-Focus on:
-1. EQUATIONS missing from the skill file
-2. TABLES with numerical results not reproduced
-3. SPECIFIC NUMBERS not captured
-4. ALGORITHM pseudocode not included
-
-Output ONLY the missing content as appendable markdown sections.
-If nothing significant is missing, respond: "NO_GAPS_FOUND"
-Do NOT repeat existing content."""
-
-
-DOMAIN_CONTEXTS = {
-    "imageclef": "\n## DOMAIN CONTEXT: ImageCLEF Deepfake 2026\n**Image**: 256x256 faces, MediaPipe 478 landmarks\n**Audio**: zero-shot voice cloning, 16kHz mono WAV\n**Adaptation notes** and **reusable patterns** required.\n",
-    "parametergolf": "\n## DOMAIN CONTEXT: Parameter Golf\n- Parameter count vs perplexity tradeoffs?\n- Quantization, pruning, weight sharing applicable?\n- Compression ratios from experiments?\n",
-    "kaggle": "\n## DOMAIN CONTEXT: Kaggle\n- Competitive edge components?\n- Inference speed for time limits?\n- Ensemble compatibility?\n",
-}
-
-def get_domain_context(d):
-    if not d: return ""
-    return DOMAIN_CONTEXTS.get(d, f"\n## DOMAIN CONTEXT: {d}\nAssess relevance.\n")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AGENTIC QUALITY LOOP — v3 core addition
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def agentic_quality_loop(skill_content, source_text, llm, max_retries=2, quality_target=7):
-    """
-    Validate → if score < target, fix gaps → re-validate → repeat.
-    On paid mode: if retries exhaust, escalate to stronger model and retry.
-    This is what makes SkillForge agentic: observe, reason, act, escalate, loop.
-    """
-    best_content = skill_content
-    best_score = 0
-    best_validation = None
-    escalations = 0
-    max_escalations = len(QUALITY_ESCALATION_CHAIN) - 1  # don't count current
-
-    while True:
-        # ── Inner loop: retry with current model ──
-        for attempt in range(max_retries + 1):
-            validation = validate_skill(best_content, llm)
-            score = validation.get("score", 0)
-            gaps = validation.get("gaps", [])
-
-            if attempt == 0 and escalations == 0:
-                print(f"🔍 Initial quality: {score}/10 (target: {quality_target}/10)")
-            elif escalations > 0 and attempt == 0:
-                model_short = llm.model.split("/")[-1][:25] if hasattr(llm, 'model') else "?"
-                print(f"🔍 Quality after escalation to {model_short}: {score}/10")
-            else:
-                print(f"🔍 Retry {attempt} quality: {score}/10")
-
-            if score >= quality_target:
-                print(f"   ✓ Quality target met ({score}/{quality_target})")
-                return best_content, validation
-
-            if score > best_score:
-                best_score = score
-                best_validation = validation
-
-            if attempt >= max_retries:
-                break
-
-            if not gaps or gaps == ["Validation parse failed"]:
-                print(f"   ⚠ No actionable gaps, skipping retry")
-                break
-
-            # ── Fix identified gaps ──
-            gaps_str = "\n".join(f"- {g}" for g in gaps)
-            print(f"   🔧 Fixing {len(gaps)} gaps…")
-            source_excerpt = source_text[:35000] if source_text else ""
-
-            fixed = llm.generate(
-                "You are SkillForge's repair agent. Fix all gaps in this skill file.",
-                GAP_FIX_PROMPT.format(
-                    score=score,
-                    gaps=gaps_str,
-                    skill_content=best_content,
-                    source_excerpt=source_excerpt,
-                ),
-                max_tokens=16000,
-            )
-
-            if fixed and len(fixed) > len(best_content) * 0.5:
-                best_content = clean_llm_output(fixed)
-                new_lines = best_content.count('\n')
-                print(f"   📝 Fixed version: {new_lines} lines")
-            else:
-                print(f"   ⚠ Fix pass returned insufficient content, keeping previous")
-                break
-
-            time.sleep(2)
-
-        # ── Inner loop exhausted — try escalation ──
-        if best_score >= quality_target:
-            return best_content, best_validation
-
-        # Check if escalation is available (paid openrouter only)
-        can_escalate = (
-            hasattr(llm, '_paid') and llm._paid
-            and hasattr(llm, 'escalate_for_quality')
-            and escalations < max_escalations
-        )
-
-        if not can_escalate:
-            if best_score < quality_target:
-                print(f"   ⚠ Max retries reached, using best ({best_score}/10)")
+                dropped += 1
+        elided = (f"\n\n> {dropped} lower-priority file section(s) elided "
+                  f"to fit LLM input budget; full source on disk under .sources/.\n\n")
+        return header + "".join(kept) + elided
+
+    if kind in ("arxiv","pdf"):
+        # Keep abstract+intro (~40%), middle methods chunk, tail (~30%)
+        n = len(bundle.text)
+        head_chars = int(budget_chars * 0.40)
+        tail_chars = int(budget_chars * 0.30)
+        mid_chars = budget_chars - head_chars - tail_chars - 300
+        head = bundle.text[:head_chars]
+        tail = bundle.text[-tail_chars:]
+        kw_pos = -1
+        for kw in ("Method","Methods","Algorithm","Architecture",
+                   "Equation","We propose","Implementation"):
+            kp = bundle.text.find(kw, head_chars)
+            if kp != -1 and kp < n - tail_chars:
+                kw_pos = kp; break
+        if kw_pos == -1:
+            kw_pos = n // 2
+        start = max(head_chars, kw_pos - mid_chars // 2)
+        end = min(n - tail_chars, start + mid_chars)
+        middle = bundle.text[start:end]
+        return (head
+                + f"\n\n[... elided {start - head_chars:,} chars; full source on disk ...]\n\n"
+                + middle
+                + f"\n\n[... elided {n - tail_chars - end:,} chars ...]\n\n"
+                + tail)
+
+    return _head_tail_truncate(bundle.text, budget_chars)
+
+
+def _head_tail_truncate(text, budget):
+    if len(text) <= budget:
+        return text
+    h = int(budget * 0.55)
+    t = int(budget * 0.40)
+    return (text[:h] + f"\n\n[... {len(text)-h-t:,} chars elided; "
+            f"full source on disk ...]\n\n" + text[-t:])
+
+
+# ─────────────────────────────────────────────────────────────
+# SKILL GENERATION + AGENTIC LOOP (fix #11)
+# ─────────────────────────────────────────────────────────────
+
+def generate_skill_once(bundle, llm, max_input_chars=350_000, max_output_tokens=16000):
+    sp = _system_prompt_for(bundle.spec.kind)
+    src_for_llm = smart_truncate_for_llm(bundle, max_input_chars)
+    user = (f"Source ({bundle.spec.kind} — {bundle.spec.url}):\n\n"
+            f"---BEGIN SOURCE---\n{src_for_llm}\n---END SOURCE---\n\n"
+            f"Produce the SKILL.md now. Use ONLY content from the source above.")
+    out = llm.generate(sp, user, max_tokens=max_output_tokens)
+    return clean_llm_output(out)
+
+
+def agentic_skill_loop(bundle, llm, max_input_chars=350_000,
+                       target_pct_verified=90.0, max_retries=2):
+    """Generate, verify, regenerate-on-flag (fix #11)."""
+    best_skill = ""
+    best_results = []
+    best_summary = {"pct_verified": 0.0, "claims_total": 0,
+                    "claims_unverified": 0, "lines_flagged": 0,
+                    "total_lines_checked": 0, "per_section": []}
+
+    print(f"   📝 Initial generation…")
+    skill = generate_skill_once(bundle, llm, max_input_chars=max_input_chars)
+    if not skill.strip():
+        return skill, [], best_summary
+
+    for attempt in range(max_retries + 1):
+        verifier = SourceVerifier(bundle.text)
+        results, summary = verifier.verify(skill)
+        print(f"   🔬 Round {attempt}: {summary['pct_verified']:.1f}% verified "
+              f"({summary['claims_unverified']}/{summary['claims_total']} unverified)")
+
+        if summary["pct_verified"] > best_summary["pct_verified"]:
+            best_skill = skill
+            best_results = results
+            best_summary = summary
+
+        if summary["pct_verified"] >= target_pct_verified:
+            print(f"   ✓ Target met ({target_pct_verified}%)")
+            return best_skill, best_results, best_summary
+
+        if attempt >= max_retries or not results:
             break
 
-        # Escalate to stronger model
-        if llm.escalate_for_quality(best_score, quality_target):
-            escalations += 1
-            # Re-run fix with the stronger model (not from scratch — use best content so far)
-            print(f"   🔧 Re-running repair with stronger model…")
-            source_excerpt = source_text[:35000] if source_text else ""
+        flagged_block = []
+        for r in results[:40]:
+            short_claims = ", ".join(c for c in r.claims_unverified[:6])
+            if len(r.claims_unverified) > 6:
+                short_claims += f", +{len(r.claims_unverified)-6} more"
+            flagged_block.append(
+                f"- Line {r.line_no}: {r.line[:160]}\n  Unverified claims: {short_claims}"
+            )
+        flagged = "\n".join(flagged_block)
+        src_excerpt = smart_truncate_for_llm(bundle, max_input_chars // 2)
+        user = (f"## Current skill file\n\n{skill}\n\n"
+                f"## Verifier flagged these lines (claims not found in source):\n\n"
+                f"{flagged}\n\n"
+                f"## Source (excerpt for reference):\n\n{src_excerpt}\n\n"
+                f"Produce the corrected, complete SKILL.md. Remove or replace every "
+                f"flagged claim. Do not introduce new unverified claims.")
+        print(f"   🔧 Regenerating with {len(results)} flagged lines as feedback…")
+        repaired = llm.generate(REPAIR_SYSTEM_PROMPT, user, max_tokens=16000)
+        repaired = clean_llm_output(repaired)
+        if repaired and len(repaired) > len(skill) * 0.4:
+            skill = repaired
+        else:
+            print(f"   ⚠ Repair returned insufficient content, keeping previous round")
+            break
 
-            # Get current gaps
-            validation = validate_skill(best_content, llm)
-            gaps = validation.get("gaps", [])
-            score = validation.get("score", 0)
+    return best_skill or skill, best_results, best_summary
+# ─────────────────────────────────────────────────────────────
+# VERIFIER — word-boundary, unicode-normalized, per-section
+# ─────────────────────────────────────────────────────────────
 
-            if score >= quality_target:
-                print(f"   ✓ Stronger model validates at {score}/{quality_target}")
-                return best_content, validation
+NUMBER_RE = re.compile(r'(?<![\w.])(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?:%|[a-zA-Z]{1,4})?)(?![\w.])')
+INLINE_CODE_RE = re.compile(r'`([^`\n]{2,80})`')
+QUOTED_RE = re.compile(r'"([^"\n]{3,80})"')
+SQUOTED_RE = re.compile(r"'([^'\n]{3,80})'")
+URL_RE = re.compile(r'\bhttps?://[^\s)\]\}"]+', re.IGNORECASE)
+PATH_RE = re.compile(r'\b[A-Za-z0-9_.-]+/[A-Za-z0-9_./\-]{2,}')
 
-            if gaps and gaps != ["Validation parse failed"]:
-                gaps_str = "\n".join(f"- {g}" for g in gaps)
-                fixed = llm.generate(
-                    "You are SkillForge's repair agent. Fix all gaps in this skill file. "
-                    "Be thorough — this is an escalation pass with a stronger model.",
-                    GAP_FIX_PROMPT.format(
-                        score=score,
-                        gaps=gaps_str,
-                        skill_content=best_content,
-                        source_excerpt=source_excerpt,
-                    ),
-                    max_tokens=16000,
-                )
+# camelCase, snake_case, MultiPascalCase, SCREAMING_SNAKE, dotted, alnum+digits
+IDENT_RE = re.compile(
+    r'\b('
+    r'[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9_]+'
+    r'|[a-zA-Z][a-zA-Z0-9]*_[a-zA-Z0-9_]+'
+    r'|[A-Z][a-z]+(?:[A-Z][a-z]+){1,}'
+    r'|[A-Z]{2,}[A-Z0-9_]+'
+    r'|[A-Za-z]+(?:\.[A-Za-z][A-Za-z0-9_]+){1,}'
+    r'|[A-Za-z]{2,}\d+[A-Za-z0-9]*'
+    r')\b'
+)
 
-                if fixed and len(fixed) > len(best_content) * 0.5:
-                    best_content = clean_llm_output(fixed)
-                    new_lines = best_content.count('\n')
-                    print(f"   📝 Escalated fix: {new_lines} lines")
+# Common technical acronyms missed by IDENT_RE (fix #15)
+KNOWN_ACRONYMS = {
+    # ML / DL
+    "Adam","AdamW","SGD","RMSprop","Adagrad","LARS","LAMB",
+    "ReLU","GELU","SiLU","ELU","SELU","Tanh","Sigmoid","Softmax",
+    "BERT","GPT","T5","BART","XLNet","RoBERTa","ViT","CLIP","LoRA","QLoRA",
+    "RNN","LSTM","GRU","CNN","MLP","GAN","VAE","NeRF","DDPM","DDIM",
+    "PPO","DPO","RLHF","TRPO","SAC","DQN","A2C","A3C","KL","MSE","CE","BCE",
+    # Hardware / runtime
+    "CUDA","ROCm","NVCC","cuDNN","NCCL","HBM","SRAM","DRAM","TPU","GPU","CPU","FPGA","ASIC",
+    "AVX","SIMD","SSE","SSE2","ARM","x86","RISCV",
+    # Web / protocols / formats
+    "HTTP","HTTPS","REST","gRPC","GraphQL","WebSocket","WebRTC",
+    "JSON","YAML","TOML","XML","HTML","CSS","SVG","CSV","TSV","Parquet","Avro",
+    "JWT","OAuth","OIDC","SAML","SSO","TLS","SSL","mTLS","DNS","BGP","NAT","CDN",
+    "TCP","UDP","ICMP","FTP","SFTP","SMTP","IMAP","POP3","SSH",
+    # Crypto / blockchain
+    "SHA","MD5","HMAC","AES","RSA","ECDSA","Ed25519","Curve25519","X25519","Schnorr",
+    "EVM","SVM","ABI","BIP","ERC","EIP","TPS","UTXO","DeFi","NFT","DAO","ZKP","SNARK","STARK",
+    "USDC","USDT","ETH","BTC","SOL","MATIC",
+    # Software / cloud
+    "CLI","SDK","API","UI","UX","IaC","CI","CD","SLA","SLO","SRE","P99","P95","P50",
+    "AWS","GCP","Azure","S3","EC2","RDS","ECS","EKS","GKE","AKS","K8s","KMS","IAM",
+    "WASM","WASI","JVM","CLR","FFI","IPC","RPC","MCP",
+    "SQL","NoSQL","ORM","CRUD","ACID","CAP","CRDT","WAL","MVCC",
+    # Stats / math
+    "FLOPs","FLOPS","BPE","WPM","BLEU","ROUGE","METEOR","CER","WER","mAP","IoU",
+}
 
-                    # Validate the escalated fix
-                    validation = validate_skill(best_content, llm)
-                    score = validation.get("score", 0)
-                    print(f"🔍 Post-escalation quality: {score}/10")
+STOPWORDS = {
+    "true","false","none","null","this","that","with","from","into","over",
+    "the","and","or","not","but","for","you","your","our","its","their",
+    "use","using","used","when","where","while","after","before","then",
+    "yes","no","unknown","unclear","specified","source","page","section",
+    "see","also","note","example","examples","other","various","more","most",
+    "many","some","few","like","such","etc","via","along","through","across",
+    "include","includes","including","required","optional","default","custom",
+}
 
-                    if score >= quality_target:
-                        print(f"   ✓ Quality target met after escalation ({score}/{quality_target})")
-                        return best_content, validation
+TRIVIAL_NUMBERS = {"0","1","2","3","4","5","6","7","8","9","10","100","1000"}
 
-                    if score > best_score:
-                        best_score = score
-                        best_validation = validation
 
-            # Continue to next escalation if still below target
+@dataclass
+class ClaimCheck:
+    line_no: int
+    line: str
+    section: str
+    claims_total: int
+    claims_unverified: list
+
+
+def _extract_claims_from_line(line, is_header, is_yaml):
+    """Returns list of (value, type), deduplicated by VALUE (fix #21)."""
+    found = []
+    seen = set()
+
+    def add(value, ctype):
+        v = value.strip()
+        if not v:
+            return
+        k = norm_text(v)
+        if not k or k in seen or k in STOPWORDS:
+            return
+        seen.add(k)
+        found.append((v, ctype))
+
+    for m in INLINE_CODE_RE.finditer(line):
+        v = m.group(1).strip()
+        if len(v) >= 2:
+            add(v, "code")
+    for m in URL_RE.finditer(line):
+        add(m.group(0).rstrip(".,;)]}>"), "url")
+    for m in PATH_RE.finditer(line):
+        v = m.group(0)
+        if not v.startswith("http") and "/" in v:
+            add(v, "path")
+    for m in QUOTED_RE.finditer(line):
+        v = m.group(1).strip()
+        if len(v) >= 3:
+            add(v, "quoted")
+    for m in SQUOTED_RE.finditer(line):
+        v = m.group(1).strip()
+        if len(v) >= 3:
+            add(v, "quoted")
+    for m in NUMBER_RE.finditer(line):
+        v = m.group(1)
+        if v in TRIVIAL_NUMBERS:
             continue
-        else:
-            print(f"   ⚠ No more models to escalate to, using best ({best_score}/10)")
-            break
+        add(v, "number")
 
-    # Return best we got
-    final_validation = validate_skill(best_content, llm) if best_score < 7 else (best_validation or validate_skill(best_content, llm))
-    return best_content, final_validation
+    # IDENT is the noisier regex — restrict to body content (not headers/YAML).
+    if not is_header and not is_yaml:
+        for m in IDENT_RE.finditer(line):
+            v = m.group(1)
+            if len(v) < 4:
+                continue
+            add(v, "identifier")
+    # Acronyms are well-curated and are the highest-signal hallucination
+    # surface inside descriptions (Adam vs SGD, REST vs GraphQL, Ed25519 vs
+    # secp256k1) — so we check them in YAML too. Skip only on raw headers.
+    if not is_header:
+        for acro in KNOWN_ACRONYMS:
+            if re.search(r'\b' + re.escape(acro) + r'\b', line):
+                add(acro, "acronym")
+
+    return found
 
 
-def validate_skill(skill_content, llm):
-    """v3.1: Use json_mode for Gemini, debug output, regex fallback."""
-    print("   🔍 Validating…")
-    # Send only first 8K chars to avoid safety filter
-    excerpt = skill_content[:8000]
-    try:
-        text = llm.generate(
-            "Respond with ONLY a JSON object. No fences. No explanation.",
-            VALIDATION_PROMPT.format(skill_content=excerpt),
-            max_tokens=1000,
-            json_mode=True,  # Forces JSON output on Gemini, skips thinking tokens
+class SourceVerifier:
+    """Line-by-line check of SKILL.md against the downloaded source.
+
+    Correctness vs v4:
+      - Unicode-normalized comparisons (NFKD + ASCII fold).
+      - Word-boundary matching for code/identifiers/quoted/acronyms.
+      - Digit-aware boundaries for numbers (no "3" inside "13").
+      - YAML `description:` IS verified (only name/id/version skipped).
+      - Per-section breakdown.
+      - In-line claim dedup by value."""
+
+    def __init__(self, source_text):
+        self.source = source_text
+        self._norm_src = norm_text(source_text)
+
+    def _match_number(self, v):
+        try:
+            pat = r'(?<![\d.eE+\-])' + re.escape(v) + r'(?![\d.eE])'
+            if re.search(pat, self._norm_src):
+                return True
+        except re.error:
+            pass
+        m = re.match(r'(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)', v)
+        if m:
+            bare = m.group(1)
+            try:
+                pat = r'(?<![\d.eE+\-])' + re.escape(bare) + r'(?![\d.eE])'
+                if re.search(pat, self._norm_src):
+                    return True
+            except re.error:
+                pass
+        return False
+
+    def _match_wordbound(self, v):
+        try:
+            pat = r'(?<!\w)' + re.escape(v) + r'(?!\w)'
+            if re.search(pat, self._norm_src):
+                return True
+        except re.error:
+            pass
+        if any(c.isspace() for c in v):
+            parts = v.split()
+            try:
+                flex = r'(?<!\w)' + r'\s+'.join(re.escape(p) for p in parts) + r'(?!\w)'
+                if re.search(flex, self._norm_src):
+                    return True
+            except re.error:
+                pass
+        return False
+
+    def _is_in_source(self, value, claim_type):
+        v = norm_text(value).strip()
+        if not v:
+            return True
+        if claim_type == "number":
+            return self._match_number(v)
+        if claim_type == "url":
+            stripped = v.rstrip(".,;)]}>")
+            return stripped in self._norm_src
+        return self._match_wordbound(v)
+
+    def verify(self, skill_text):
+        in_yaml = False
+        in_fence = False
+        current_section = "(top)"
+        section_stats = defaultdict(lambda: {"total":0,"unverified":0,
+                                              "lines":0,"flagged_lines":0})
+        results = []
+        total_claims = 0
+        total_unverified = 0
+        total_lines = 0
+
+        for i, raw_line in enumerate(skill_text.splitlines(), start=1):
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            total_lines += 1
+
+            # YAML frontmatter (fix #2: only skip metadata keys, not description)
+            if i == 1 and stripped == "---":
+                in_yaml = True
+                continue
+            if in_yaml and stripped == "---":
+                in_yaml = False
+                continue
+            if in_yaml:
+                if re.match(r'^(name|id|version|category|author|date):\s', stripped, re.I):
+                    continue
+
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+
+            if stripped.startswith("## "):
+                current_section = stripped.lstrip("# ").strip()[:60] or "(unnamed)"
+
+            is_header = stripped.startswith("#")
+            claims = _extract_claims_from_line(line, is_header=is_header, is_yaml=in_yaml)
+            section_stats[current_section]["lines"] += 1
+            if not claims:
+                continue
+
+            unverified = []
+            for value, ctype in claims:
+                total_claims += 1
+                section_stats[current_section]["total"] += 1
+                if not self._is_in_source(value, ctype):
+                    unverified.append(f"{ctype}:{value}")
+                    total_unverified += 1
+                    section_stats[current_section]["unverified"] += 1
+
+            if unverified:
+                section_stats[current_section]["flagged_lines"] += 1
+                results.append(ClaimCheck(
+                    line_no=i, line=line, section=current_section,
+                    claims_total=len(claims),
+                    claims_unverified=unverified,
+                ))
+
+        per_section = []
+        for name, st in section_stats.items():
+            pct = (1.0 - st["unverified"]/st["total"]) * 100 if st["total"] else 100.0
+            per_section.append({
+                "section": name,
+                "claims_total": st["total"],
+                "claims_unverified": st["unverified"],
+                "pct_verified": pct,
+                "lines": st["lines"],
+                "flagged_lines": st["flagged_lines"],
+            })
+        per_section.sort(key=lambda s: s["pct_verified"])
+
+        summary = {
+            "total_lines_checked": total_lines,
+            "lines_flagged": len(results),
+            "claims_total": total_claims,
+            "claims_unverified": total_unverified,
+            "pct_verified": (1.0 - total_unverified/total_claims) * 100 if total_claims else 100.0,
+            "per_section": per_section,
+        }
+        return results, summary
+
+
+def write_verification_report(skill_path, results, summary, source_url):
+    """VERIFICATION.md with per-section breakdown (fix #22)."""
+    ver_path = str(Path(skill_path).with_name("VERIFICATION.md"))
+    lines = [
+        f"# Verification report for `{Path(skill_path).name}`",
+        f"",
+        f"- Source: {source_url}",
+        f"- Generated: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"",
+        f"## Summary",
+        f"- Total claims checked: **{summary['claims_total']}**",
+        f"- Unverified claims: **{summary['claims_unverified']}**",
+        f"- Lines flagged: **{summary['lines_flagged']}** of {summary['total_lines_checked']}",
+        f"- Overall verified: **{summary['pct_verified']:.1f}%**",
+        f"",
+        f"## Per-section breakdown",
+        f"",
+        f"| Section | Claims | Unverified | % verified | Lines flagged |",
+        f"| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for s in summary["per_section"]:
+        if s["claims_total"] == 0:
+            continue
+        lines.append(
+            f"| {s['section']} | {s['claims_total']} | {s['claims_unverified']} "
+            f"| {s['pct_verified']:.1f}% | {s['flagged_lines']}/{s['lines']} |"
         )
-        if not text:
-            return {"score": 0, "gaps": ["Validation returned empty"], "is_production_ready": False}
-
-        # Try standard JSON parsing first
-        parsed = parse_json_from_llm(text)
-        if parsed and "score" in parsed:
-            return parsed
-
-        # Fallback: regex extraction if JSON parsing failed
-        print(f"   ⚠ JSON parse failed, trying regex. Raw ({len(text)} chars): {text[:150]}")
-        score_match = re.search(r'"score"\s*:\s*(\d+)', text)
-        if score_match:
-            score = int(score_match.group(1))
-            gaps = re.findall(r'"([^"]{10,})"', text)  # Extract strings >10 chars as potential gaps
-            return {"score": score, "gaps": gaps[:5], "is_production_ready": score >= 7}
-
-    except Exception as e:
-        print(f"   Validation error: {e}")
-    return {"score": 0, "gaps": ["Validation parse failed"], "is_production_ready": False}
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# GITHUB REPO HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TEXT_EXTENSIONS = {
-    ".py",".pyx",".pxd",".js",".jsx",".ts",".tsx",".mjs",".cjs",
-    ".java",".kt",".kts",".scala",".groovy",
-    ".c",".h",".cpp",".cxx",".cc",".hpp",".hxx",
-    ".cs",".fs",".fsx",".go",".rs",".rb",".php",".pl",".pm",
-    ".swift",".m",".mm",".lua",".r",".R",".jl",".ex",".exs",
-    ".zig",".nim",".v",".d",
-    ".sh",".bash",".zsh",".fish",".bat",".cmd",".ps1",
-    ".sql",".graphql",".gql",".proto",".thrift",".avsc",
-    ".md",".mdx",".rst",".txt",".text",".adoc",
-    ".html",".htm",".xml",".xhtml",".svg",
-    ".css",".scss",".sass",".less",".styl",
-    ".json",".jsonc",".json5",".yaml",".yml",
-    ".toml",".ini",".cfg",".conf",".env",".envrc",
-    ".properties",".gradle",".dockerfile",".tf",".hcl",
-    ".nix",".dhall",".ipynb",".csv",".tsv",
-    ".cmake",".makefile",".mk",".lock",
-}
-ALWAYS_INCLUDE_NAMES = {
-    "Dockerfile","Makefile","CMakeLists.txt","Gemfile","Rakefile",
-    "Procfile","LICENSE","LICENCE","NOTICE","Pipfile","Brewfile",
-    ".gitignore",".gitattributes",".gitmodules",".dockerignore",
-    ".editorconfig",".flake8",".pylintrc",".clang-format",
-    "requirements.txt","setup.py","setup.cfg","pyproject.toml",
-    "package.json","package-lock.json","yarn.lock","pnpm-lock.yaml",
-    "Cargo.toml","Cargo.lock","go.mod","go.sum",
-    "build.gradle","settings.gradle","pom.xml",
-    "Justfile","Taskfile.yml","CODEOWNERS",
-    "CHANGELOG","CHANGELOG.md","CONTRIBUTING.md",
-}
-SKIP_DIRS = {
-    ".git","node_modules","__pycache__",".tox",".nox",
-    ".mypy_cache",".pytest_cache",".ruff_cache",
-    "venv",".venv","env",".env",
-    "dist","build","target","out","bin","obj",
-    ".idea",".vscode",".vs","vendor","third_party","3rdparty",
-    ".eggs","site-packages",".ipynb_checkpoints",
-    "wandb","mlruns","lightning_logs","logs","log","__MACOSX",
-}
-PRIORITY_PATTERNS = [
-    re.compile(r"^README", re.I), re.compile(r"^INSTALL", re.I),
-    re.compile(r"^setup\.(py|cfg)$", re.I), re.compile(r"^pyproject\.toml$", re.I),
-    re.compile(r"^requirements.*\.txt$", re.I), re.compile(r"^package\.json$", re.I),
-    re.compile(r"^Cargo\.toml$", re.I), re.compile(r"^go\.mod$", re.I),
-    re.compile(r"^Dockerfile", re.I), re.compile(r"^Makefile$", re.I),
-]
-KEEP_PRIORITY = [
-    re.compile(r"README", re.I), re.compile(r"setup\.(py|cfg)", re.I),
-    re.compile(r"pyproject\.toml", re.I), re.compile(r"requirements", re.I),
-    re.compile(r"config", re.I), re.compile(r"model", re.I),
-    re.compile(r"network", re.I), re.compile(r"train", re.I),
-    re.compile(r"infer", re.I), re.compile(r"loss", re.I),
-    re.compile(r"__init__\.py", re.I), re.compile(r"manager", re.I),
-]
-DROP_PRIORITY = [
-    re.compile(r"\.lock$", re.I), re.compile(r"package-lock", re.I),
-    re.compile(r"\.csv$|\.tsv$", re.I), re.compile(r"test_|_test\.|tests/", re.I),
-    re.compile(r"LICENSE|LICENCE|NOTICE", re.I),
-    re.compile(r"CONTRIBUTING|CODE_OF_CONDUCT", re.I),
-    re.compile(r"\.github/", re.I), re.compile(r"docs/", re.I),
-]
-FENCE_LANG = {
-    ".py":"python",".js":"javascript",".ts":"typescript",".java":"java",
-    ".c":"c",".h":"c",".cpp":"cpp",".go":"go",".rs":"rust",".rb":"ruby",
-    ".sh":"bash",".sql":"sql",".html":"html",".css":"css",
-    ".json":"json",".yaml":"yaml",".yml":"yaml",".toml":"toml",
-    ".md":"markdown",".dockerfile":"dockerfile",".ipynb":"python",
-}
-
-def is_text_file(p):
-    if p.name in ALWAYS_INCLUDE_NAMES: return True
-    if p.suffix.lower() in TEXT_EXTENSIONS: return True
-    if not p.suffix and p.name.startswith("."): return True
-    return False
-def is_binary(d): return b"\x00" in d[:8192]
-def skip_dir(d): return d in SKIP_DIRS or d.endswith(".egg-info")
-
-def clone_repo(url, dest):
-    url = url.rstrip("/")
-    if not url.endswith(".git"): url += ".git"
-    with Spinner(f"Cloning {url.split('/')[-1]}"):
-        r = subprocess.run(["git","clone","--depth","1","--single-branch",url,dest],
-                           capture_output=True, text=True)
-    if r.returncode != 0: print(f"❌ git clone failed:\n{r.stderr}",file=sys.stderr); sys.exit(1)
-
-def extract_repo_meta(url):
-    url = url.rstrip("/")
-    pts = url.replace("https://","").replace("http://","").split("/")
-    return {"owner": pts[1] if len(pts)>1 else "?",
-            "repo": pts[2].replace(".git","") if len(pts)>2 else "?", "url": url}
-
-def build_tree(root, max_d=5):
-    lines = []
-    def _r(cur, pfx, d):
-        if d > max_d: lines.append(f"{pfx}…"); return
-        try: entries = sorted(cur.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
-        except PermissionError: return
-        dirs = [e for e in entries if e.is_dir() and not skip_dir(e.name)]
-        files = [e for e in entries if e.is_file()]
-        items = dirs + files
-        for i, e in enumerate(items):
-            last = i == len(items)-1
-            c = "└── " if last else "├── "
-            if e.is_dir():
-                lines.append(f"{pfx}{c}{e.name}/")
-                _r(e, pfx+("    " if last else "│   "), d+1)
-            else:
-                lines.append(f"{pfx}{c}{e.name}  ({sizeof_fmt(e.stat().st_size)})")
-    _r(root, "", 0)
-    return "\n".join(lines)
-
-def flatten_nb(content):
-    try: nb = json.loads(content)
-    except: return content
-    parts = []
-    for i, c in enumerate(nb.get("cells",[])):
-        s = "".join(c.get("source",[]))
-        if s.strip(): parts.append(f"# Cell {i+1} [{c.get('cell_type','?')}]\n{s}")
-    return "\n\n".join(parts)
-
-def collect_files(root, max_kb=200):
-    inc, skip = [], []
-    mx = max_kb * 1024
-    for dp, dns, fns in os.walk(root):
-        dns[:] = [d for d in dns if not skip_dir(d)]
-        for fn in sorted(fns):
-            fp = Path(dp)/fn; rel = str(fp.relative_to(root))
-            if not is_text_file(fp): skip.append((rel,"non-text")); continue
-            try: sz = fp.stat().st_size
-            except: skip.append((rel,"unreadable")); continue
-            if sz > mx: skip.append((rel,f">{max_kb}KB")); continue
-            if sz == 0: skip.append((rel,"empty")); continue
-            try: raw = fp.read_bytes()
-            except: skip.append((rel,"read error")); continue
-            if is_binary(raw): skip.append((rel,"binary")); continue
-            try: txt = raw.decode("utf-8", errors="replace")
-            except: skip.append((rel,"decode error")); continue
-            inc.append((rel, txt))
-    return inc, skip
-
-def p_sort(rp):
-    fn = Path(rp).name
-    for i,p in enumerate(PRIORITY_PATTERNS):
-        if p.search(fn): return (0,i,rp)
-    return (1, rp.count("/"), rp)
-
-def p_score(path):
-    for i,p in enumerate(DROP_PRIORITY):
-        if p.search(path): return (2,i,path)
-    for i,p in enumerate(KEEP_PRIORITY):
-        if p.search(path): return (0,i,path)
-    return (1, path.count("/"), path)
-
-def build_raw_dump(meta, tree, inc, skip):
-    inc.sort(key=lambda p: p_sort(p[0]))
-    ts = datetime.datetime.now().strftime("%d%b%Y_%I%M%p").lower()
-    tc = sum(len(c) for _,c in inc)
-    parts = [f"# RAW DUMP — {meta['owner']}/{meta['repo']}\n",
-             f"- **Source:** {meta['url']}", f"- **Captured:** {ts}",
-             f"- **Files:** {len(inc)}", f"- **Chars:** {tc:,}\n",
-             "---\n\n## Directory Structure\n\n```", tree, "```\n"]
-    if skip:
-        parts.append("---\n\n## Skipped\n")
-        for r,rs in sorted(skip)[:30]: parts.append(f"- `{r}` — {rs}")
-    parts.append("\n---\n\n## File Contents\n")
-    for rel, content in inc:
-        suf = Path(rel).suffix.lower()
-        if suf == ".ipynb": content = flatten_nb(content)
-        lang = FENCE_LANG.get(suf, "")
-        parts.append(f"### `{rel}`\n\n```{lang}\n{content}\n```\n")
-    return "\n".join(parts)
-
-def split_sections(dump):
-    mk = "## File Contents"
-    idx = dump.find(mk)
-    if idx == -1: return dump, []
-    header = dump[:idx+len(mk)]
-    body = dump[idx+len(mk):]
-    pat = re.compile(r'^### `(.+?)`\s*$', re.MULTILINE)
-    ms = list(pat.finditer(body))
-    secs = []
-    for i,m in enumerate(ms):
-        end = ms[i+1].start() if i+1<len(ms) else len(body)
-        secs.append((m.group(1), body[m.start():end]))
-    return header, secs
-
-def trim_budget(dump, budget):
-    cur = estimate_tokens(dump)
-    if cur <= budget: return dump
-    print(f"⚠️  ~{cur:,} tok > {budget:,}. Trimming…")
-    header, secs = split_sections(dump)
-    secs.sort(key=lambda p: p_score(p[0]))
-    kept, dropped = [], []
-    rem = budget - estimate_tokens(header) - 5000
-    for path, content in secs:
-        t = estimate_tokens(content)
-        if rem >= t: kept.append((path,content)); rem -= t
-        else: dropped.append(path)
-    if dropped: print(f"   ✂️  Kept {len(kept)}, dropped {len(dropped)}")
-    result = header + "\n\n"
-    if dropped:
-        result += f"> {len(dropped)} files trimmed\n\n"
-    for _,c in kept: result += c
-    return result
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# GITHUB PIPELINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def github_pipeline(url, llm, output_dir, max_file_kb=200,
-                    token_budget=150000, domain=None, skip_val=False, quality_target=7):
-    meta = extract_repo_meta(url)
-    tmpdir = tempfile.mkdtemp(prefix="sf_")
-    clone_dest = os.path.join(tmpdir, meta["repo"])
-    try:
-        clone_repo(url, clone_dest)
-        root = Path(clone_dest)
-        print("📂 Building tree…")
-        tree = build_tree(root)
-        print("📄 Reading files…")
-        inc, skip = collect_files(root, max_file_kb)
-        print(f"   ✓ {len(inc)} included, {len(skip)} skipped")
-        raw_dump = build_raw_dump(meta, tree, inc, skip)
-        print(f"📦 Raw dump: {len(raw_dump):,} chars (~{estimate_tokens(raw_dump):,} tok)")
-
-        if llm is None:
-            out = Path(output_dir) / f"raw_dump_{meta['repo']}.md"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(raw_dump)
-            print(f"✅ Raw dump saved: {out}"); return str(out)
-
-        trimmed = trim_budget(raw_dump, token_budget)
-        dc = get_domain_context(domain)
-        sp = GITHUB_SYSTEM_PROMPT.format(domain_context=dc)
-
-        tot = estimate_tokens(trimmed) + estimate_tokens(sp) + 500
-        if tot > token_budget * 1.5:
-            print("📋 Two-pass (large repo)")
-            skill_content = _gh_two_pass(llm, sp, trimmed, token_budget)
-        else:
-            print(f"📡 Single-pass via {llm.provider}…")
-            skill_content = llm.generate(
-                sp,
-                f"Complete source dump. Produce SKILL.md. Target 400+ lines.\n\n"
-                f"---BEGIN---\n\n{trimmed}\n\n---END---",
-                max_tokens=16000,
-            )
-
-        skill_content = clean_llm_output(skill_content)
-
-        # ── AGENTIC LOOP ──
-        if not skip_val:
-            skill_content, validation = agentic_quality_loop(
-                skill_content, trimmed[:35000], llm, max_retries=2, quality_target=quality_target
-            )
-        else:
-            validation = None
-
-        name = extract_skill_name(skill_content) or meta["repo"]
-        return _save_skill(skill_content, name, output_dir, validation)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _gh_two_pass(llm, sp, dump, budget):
-    header, secs = split_sections(dump)
-    secs.sort(key=lambda p: p_score(p[0]))
-    half = (budget - estimate_tokens(header)) // 2
-    p1, p2 = [], []
-    left = half
-    for path, content in secs:
-        t = estimate_tokens(content)
-        if left >= t: p1.append((path,content)); left -= t
-        else: p2.append((path,content))
-    p1d = header + "\n\n" + "".join(c for _,c in p1)
-    print(f"📡 Pass 1: {len(p1)} files…")
-    outline = llm.generate(sp,
-        f"PART 1 (priority files). Mark gaps [NEEDS_PART2].\n\n---BEGIN---\n\n{p1d}\n\n---END---",
-        max_tokens=12000)
-    p2b = budget - estimate_tokens(outline) - 5000
-    p2p, used = [], 0
-    for _,c in p2:
-        t = estimate_tokens(c)
-        if used+t <= p2b: p2p.append(c); used += t
-    p2d = "".join(p2p)
-    print(f"📡 Pass 2: {len(p2p)} files…")
-    return llm.generate_multi_turn(sp, [
-        {"role":"user","content":f"PART 1:\n\n---BEGIN---\n\n{p1d}\n\n---END---"},
-        {"role":"assistant","content":outline},
-        {"role":"user","content":f"PART 2. COMPLETE FINAL SKILL.md.\n\n---BEGIN---\n\n{p2d}\n\n---END---"},
-    ], max_tokens=16000)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PDF / ARXIV PIPELINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def download_arxiv(aid, od="/tmp"):
-    aid = aid.strip()
-    for pfx in ["https://arxiv.org/abs/","https://arxiv.org/pdf/",
-                 "http://arxiv.org/abs/","http://arxiv.org/pdf/",
-                 "arxiv.org/abs/","arxiv.org/pdf/"]:
-        if aid.startswith(pfx): aid = aid[len(pfx):]; break
-    aid = aid.replace(".pdf","").split("v")[0]
-    url = f"https://arxiv.org/pdf/{aid}.pdf"
-    out = os.path.join(od, f"{aid.replace('/','_')}.pdf")
-    with Spinner(f"Downloading {url}"):
-        req = urllib.request.Request(url, headers={"User-Agent":"SkillForge/4.0"})
-        with urllib.request.urlopen(req) as r, open(out,"wb") as f: f.write(r.read())
-    print(f"   📥 Saved to {out}")
-    return out
-
-def extract_pdf(path, max_p=40):
-    fitz = _require_fitz()
-    doc = fitz.open(path)
-    pages = min(len(doc), max_p)
-    parts = [f"--- PAGE {i+1}/{pages} ---\n{doc[i].get_text('text')}" for i in range(pages)]
-    doc.close()
-    combined = "\n".join(parts)
-    print(f"📄 Extracted {len(combined):,} chars from {pages} pages")
-    return combined
-
-def chunk_text(text, max_c=50000):
-    if len(text) <= max_c: return [text]
-    chunks, cur = [], ""
-    for page in text.split("--- PAGE "):
-        if not page.strip(): continue
-        block = f"--- PAGE {page}"
-        if len(cur) + len(block) > max_c:
-            if cur: chunks.append(cur)
-            cur = block
-        else: cur += block
-    if cur: chunks.append(cur)
-    return chunks
-
-
-def pdf_pipeline(pdf_path, llm, output_dir, domain=None, max_pages=40, skip_val=False, quality_target=7):
-    paper_text = extract_pdf(pdf_path, max_pages)
-
-    if llm is None:
-        out = Path(output_dir) / f"raw_{Path(pdf_path).stem}.md"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(paper_text)
-        print(f"✅ Raw text saved: {out}"); return str(out)
-
-    dc = get_domain_context(domain)
-    merge_prompt = PAPER_SYSTEM_PROMPT.format(domain_context=dc)
-    chunks = chunk_text(paper_text)
-    t0 = time.time()
-
-    if len(chunks) == 1:
-        print(f"📡 Single-pass via {llm.provider}…")
-        skill_content = llm.generate(
-            merge_prompt,
-            f"Complete paper:\n\n{chunks[0]}\n\nProduce SKILL.md. Target 400+ lines. EXHAUSTIVE.",
-            max_tokens=16000)
+    lines.append("")
+    if not results:
+        lines.append("✅ No unverified claims found.")
     else:
-        print(f"📡 Phase 1: Deep extraction ({len(chunks)} chunks) via {llm.provider}…")
-        partials = []
-        for i, chunk in enumerate(chunks):
-            print(f"   Chunk {i+1}/{len(chunks)} ({len(chunk):,} chars)…")
-            p = llm.generate(
-                CHUNK_EXTRACTION_PROMPT,
-                f"{chunk}\n\nChunk {i+1}/{len(chunks)}. Extract EVERYTHING.",
-                max_tokens=16000)
-            partials.append(p)
-            time.sleep(2)
-
-        print("   Phase 2: Merging…")
-        sep = "\n\n" + "═"*40 + " NEXT SECTION " + "═"*40 + "\n\n"
-        merged = sep.join(partials)
-        skill_content = llm.generate(
-            merge_prompt,
-            f"{len(chunks)} extractions from same paper. Merge into SKILL.md.\n"
-            f"MUST be 400+ lines. Include EVERY equation, table, result.\n\n{merged}",
-            max_tokens=16000)
-
-        # Phase 3: Enrichment if thin
-        skill_content = clean_llm_output(skill_content)
-        lines = skill_content.count('\n')
-        print(f"   Phase 2: {lines} lines")
-        if lines < 380:
-            print("   Phase 3: Enrichment…")
-            adds = llm.generate(
-                ENRICHMENT_PROMPT,
-                f"SKILL FILE ({lines} lines):\n\n{skill_content}\n\n{'═'*40}\n\n"
-                f"ORIGINAL:\n\n{paper_text[:40000]}",
-                max_tokens=8000)
-            adds = clean_llm_output(adds)
-            if adds.strip() and "NO_GAPS_FOUND" not in adds:
-                skill_content = skill_content.rstrip() + "\n\n---\n\n## Additional Details\n\n" + adds
-                print(f"   Enrichment: {skill_content.count(chr(10))} lines")
-
-    elapsed = time.time() - t0
-    skill_content = clean_llm_output(skill_content)
-
-    # ── AGENTIC LOOP ──
-    if not skip_val:
-        skill_content, validation = agentic_quality_loop(
-            skill_content, paper_text[:35000], llm, max_retries=2, quality_target=quality_target
-        )
-    else:
-        validation = None
-
-    name = extract_skill_name(skill_content) or Path(pdf_path).stem
-    result = _save_skill(skill_content, name, output_dir, validation)
-    print(f"   ⏱ Total: {time.time()-t0:.1f}s")
-    return result
+        lines.append("## Flagged lines\n")
+        lines.append("Each entry lists the skill-file line and the specific claims")
+        lines.append("that could not be located in the downloaded source.\n")
+        for r in results:
+            lines.append(f"### Line {r.line_no} — section: _{r.section}_")
+            lines.append(f"")
+            lines.append(f"> {r.line[:300]}")
+            lines.append(f"")
+            lines.append(f"Unverified ({len(r.claims_unverified)} of {r.claims_total}):")
+            for c in r.claims_unverified:
+                lines.append(f"- `{c}`")
+            lines.append("")
+    Path(ver_path).write_text("\n".join(lines), encoding="utf-8")
+    return ver_path
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SAVE + HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def annotate_skill_inline(skill_path, results):
+    skill = Path(skill_path).read_text(encoding="utf-8")
+    flagged_by_line = {r.line_no: r for r in results}
+    out = []
+    for i, line in enumerate(skill.splitlines(), start=1):
+        if i in flagged_by_line:
+            r = flagged_by_line[i]
+            short = ", ".join(c.split(":",1)[-1] for c in r.claims_unverified[:4])
+            if len(r.claims_unverified) > 4:
+                short += f", +{len(r.claims_unverified)-4} more"
+            out.append(f"{line}  <!-- ⚠ UNVERIFIED: {short} -->")
+        else:
+            out.append(line)
+    Path(skill_path).write_text("\n".join(out) + "\n", encoding="utf-8")
 
-def extract_skill_name(c):
-    m = re.search(r'^name:\s*(.+)$', c, re.MULTILINE)
-    return m.group(1).strip() if m else None
 
-def _save_skill(content, name, output_dir, validation):
-    """Dedup: skip if exists and new is smaller, else backup + overwrite."""
-    skill_dir = Path(output_dir) / name
-    out = skill_dir / "SKILL.md"
-    if out.exists():
-        old_sz = out.stat().st_size
-        new_sz = len(content)
-        if new_sz <= old_sz:
-            print(f"\n⏭️  Skipped: {out} exists ({old_sz:,}B ≥ {new_sz:,}B)")
-            return str(out)
-        ts = datetime.datetime.now().strftime("%H%M%S")
-        backup = skill_dir / f"SKILL_prev_{ts}.md"
-        shutil.copy2(out, backup)
-        print(f"   📦 Backed up → {backup.name}")
+# ─────────────────────────────────────────────────────────────
+# SAVE — frontmatter-only name + collision disambiguation
+# ─────────────────────────────────────────────────────────────
 
+def extract_skill_name(content):
+    """Read `name:` ONLY from the YAML frontmatter span (fix #3)."""
+    m = re.match(r'^---\s*\r?\n(.*?)\r?\n---\s*\r?\n', content, re.DOTALL)
+    if not m:
+        return None
+    frontmatter = m.group(1)
+    nm = re.search(r'^name:\s*(.+)$', frontmatter, re.MULTILINE)
+    return nm.group(1).strip() if nm else None
+
+
+def save_skill(content, name, output_dir, source_url=""):
+    """Save SKILL.md. Disambiguate name on collision (fix #14)."""
+    out_root = Path(output_dir)
+    skill_dir = out_root / name
+    if skill_dir.exists():
+        marker = skill_dir / ".source_url"
+        if marker.exists():
+            existing = marker.read_text(encoding="utf-8").strip()
+            if existing and source_url and existing != source_url:
+                slug = short_hash(source_url, 6)
+                disambig = f"{name}__{slug}"
+                print(f"   ⚠ Name '{name}' already taken by {existing}; "
+                      f"using '{disambig}' instead")
+                name = disambig
+                skill_dir = out_root / name
+        out = skill_dir / "SKILL.md"
+        if out.exists():
+            ts = _dt.datetime.now().strftime("%H%M%S")
+            backup = skill_dir / f"SKILL_prev_{ts}.md"
+            shutil.copy2(out, backup)
+            print(f"   📦 Backed up → {backup.name}")
     skill_dir.mkdir(parents=True, exist_ok=True)
-    out.write_text(content)
-    lines = content.count("\n")
-    print(f"\n✅ Saved: {out}")
-    print(f"   {lines} lines, {len(content):,} chars")
-    if validation:
-        s = validation.get("score", "?")
-        print(f"   Quality: {s}/10")
-        for g in validation.get("gaps", [])[:5]:
-            print(f"   ⚠ {g}")
-        if validation.get("is_production_ready"):
-            print("   ✓ Production ready")
-    return str(out)
+    if source_url:
+        (skill_dir / ".source_url").write_text(source_url, encoding="utf-8")
+    out_path = skill_dir / "SKILL.md"
+    out_path.write_text(content, encoding="utf-8")
+    print(f"   ✅ {out_path}  ({content.count(chr(10))} lines, {len(content):,} chars)")
+    return str(out_path)
+# ─────────────────────────────────────────────────────────────
+# DRIVER
+# ─────────────────────────────────────────────────────────────
 
-def detect_type(src):
-    s = src.strip()
-    if "github.com" in s: return "github"
-    if re.match(r'^\d{4}\.\d{4,5}$', s): return "arxiv"
-    if "arxiv.org" in s: return "arxiv"
-    if os.path.isfile(s): return "pdf"
-    if re.match(r'^[a-z-]+/\d+$', s): return "arxiv"
-    return "unknown"
-
-
-VERIFY_PROMPT = """You are a fact-checker for technical skill files. Given a skill file,
-verify that:
-1. All equations are mathematically correct (no missing terms, wrong operators)
-2. All tables have consistent rows/columns and plausible numbers
-3. All hyperparameter values are realistic (learning rates, batch sizes, temperatures)
-4. No hallucinated paper titles, author names, or benchmark numbers
-
-Respond with ONLY a JSON object:
-{
-  "verified": true/false,
-  "issues_found": 0,
-  "issues": ["description of each issue"],
-  "confidence": 0.0-1.0
-}
-
-SKILL FILE:
-{skill_content}
-"""
+@dataclass
+class RunOptions:
+    output: str = "./skills"
+    provider: str = "gemini"
+    model: str = None
+    api_key: str = None
+    max_input_chars: int = 350_000
+    max_org_repos: int = 25
+    crawl_pages: int = 25
+    clone_timeout: int = 300
+    recurse_submodules: bool = True
+    max_repo_mb: int = 800
+    agentic_retries: int = 2
+    target_pct_verified: float = 90.0
+    no_llm: bool = False
+    annotate_skill: bool = False
+    skip_verify: bool = False
+    headless: bool = True
+    json_output: bool = False
 
 
-def _verify_skill(skill_path, llm):
-    """Post-generation verification pass: re-check equations, tables, numbers."""
-    print(f"\n🔬 Verification pass on {Path(skill_path).name}…")
-    content = Path(skill_path).read_text()
+def emit_json_result(opts, record):
+    if opts.json_output:
+        sys.stdout.write(json.dumps(record) + "\n")
+        sys.stdout.flush()
 
-    # Only send first 12K to avoid context issues on free tier
-    excerpt = content[:12000]
 
-    with Spinner("Verifying equations and tables"):
-        result = llm.generate(
-            "Respond with ONLY a JSON object. No fences. No explanation.",
-            VERIFY_PROMPT.format(skill_content=excerpt),
-            max_tokens=2000,
-            json_mode=True,
-        )
+def process_spec(spec, opts, downloader, llm):
+    records = []
+    if spec.kind == "skip" or spec.kind == "unknown":
+        print(f"   ⏭️  Skipping ({spec.kind}): {spec.raw}")
+        rec = {"raw": spec.raw, "kind": spec.kind, "status": "skipped"}
+        emit_json_result(opts, rec); records.append(rec); return records
 
-    if not result:
-        print("   ⚠ Verification returned empty, skipping")
+    bundles = downloader.download(spec)
+    if not isinstance(bundles, list):
+        bundles = [bundles]
+
+    for bundle in bundles:
+        save_bundle(bundle, opts.output)
+
+        if opts.no_llm or llm is None:
+            raw_path = Path(opts.output) / bundle.skill_basename / "RAW.md"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text(bundle.text, encoding="utf-8")
+            print(f"   ✅ Raw dump only: {raw_path}")
+            rec = {"raw": spec.raw, "kind": bundle.spec.kind,
+                   "url": bundle.spec.url, "status": "raw_only",
+                   "raw_path": str(raw_path),
+                   "source_dir": bundle.on_disk_path}
+            emit_json_result(opts, rec); records.append(rec); continue
+
+        print(f"   📡 Generating SKILL.md ({bundle.spec.kind}) → {bundle.skill_basename}")
+        if opts.skip_verify:
+            skill = generate_skill_once(bundle, llm, max_input_chars=opts.max_input_chars)
+            results, summary = [], {"pct_verified": -1.0,
+                                    "claims_total": 0,
+                                    "claims_unverified": 0,
+                                    "lines_flagged": 0,
+                                    "total_lines_checked": skill.count("\n") + 1,
+                                    "per_section": []}
+        else:
+            skill, results, summary = agentic_skill_loop(
+                bundle, llm,
+                max_input_chars=opts.max_input_chars,
+                target_pct_verified=opts.target_pct_verified,
+                max_retries=opts.agentic_retries,
+            )
+
+        if not skill.strip():
+            print(f"   ⚠ LLM returned empty for {bundle.skill_basename}")
+            rec = {"raw": spec.raw, "kind": bundle.spec.kind,
+                   "url": bundle.spec.url, "status": "empty_llm"}
+            emit_json_result(opts, rec); records.append(rec); continue
+
+        name = extract_skill_name(skill) or bundle.skill_basename
+        skill_path = save_skill(skill, name, opts.output,
+                                source_url=bundle.spec.url)
+
+        ver_path = ""
+        if not opts.skip_verify:
+            ver_path = write_verification_report(skill_path, results, summary,
+                                                 bundle.spec.url)
+            print(f"   📋 Verification: {summary['pct_verified']:.1f}% claims verified "
+                  f"({summary['claims_unverified']} of {summary['claims_total']} flagged)")
+            print(f"   📋 Report: {ver_path}")
+            worst = next((s for s in summary["per_section"]
+                          if s["claims_total"] >= 3 and s["pct_verified"] < summary["pct_verified"]),
+                         None)
+            if worst:
+                print(f"   ⚠ Worst section: '{worst['section']}' at "
+                      f"{worst['pct_verified']:.1f}%")
+            if opts.annotate_skill and results:
+                annotate_skill_inline(skill_path, results)
+                print(f"   📝 Inline ⚠ UNVERIFIED markers added")
+
+        rec = {"raw": spec.raw, "kind": bundle.spec.kind,
+               "url": bundle.spec.url, "status": "ok",
+               "skill_path": skill_path,
+               "verification_path": ver_path,
+               "source_dir": bundle.on_disk_path,
+               "pct_verified": round(summary["pct_verified"], 1),
+               "claims_total": summary["claims_total"],
+               "claims_unverified": summary["claims_unverified"],
+               "lines_flagged": summary["lines_flagged"]}
+        emit_json_result(opts, rec); records.append(rec)
+
+    return records
+
+
+def maybe_warn_github_auth(specs):
+    """Fix #17 — surface GitHub rate-limit warning at startup."""
+    if os.environ.get("GITHUB_TOKEN"):
         return
-
-    parsed = parse_json_from_llm(result)
-    if not parsed:
-        print("   ⚠ Could not parse verification result")
+    needs_api = sum(1 for s in specs if s.kind in ("github_pr","github_org","github_blob"))
+    if needs_api == 0:
         return
+    print()
+    print("─" * 60)
+    print(f"  ⚠ {needs_api} source(s) need the GitHub API "
+          f"(PR / org / blob fetches)")
+    print(f"  ⚠ No GITHUB_TOKEN set — anonymous limit is 60 requests/hour")
+    print(f"     Set GITHUB_TOKEN to a fine-grained PAT for 5000/hour")
+    print("─" * 60)
 
-    verified = parsed.get("verified", False)
-    issues = parsed.get("issues", [])
-    confidence = parsed.get("confidence", 0)
-
-    if verified:
-        print(f"   ✅ Verified (confidence: {confidence:.0%})")
-    else:
-        print(f"   ⚠ Found {len(issues)} issue(s) (confidence: {confidence:.0%}):")
-        for issue in issues[:5]:
-            print(f"      ├─ {issue}")
-        print(f"   💡 Review the skill file manually for these items")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CLI
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def process_one(src, llm, args):
-    t = detect_type(src)
-    qt = getattr(args, 'quality', 7)
-    if t == "github":
-        return github_pipeline(src, llm, args.output, args.max_file_kb,
-                               args.token_budget, args.domain, args.skip_validation,
-                               quality_target=qt)
-    elif t == "arxiv":
-        pdf = download_arxiv(src)
-        return pdf_pipeline(pdf, llm, args.output, args.domain,
-                            args.max_pages, args.skip_validation,
-                            quality_target=qt)
-    elif t == "pdf":
-        return pdf_pipeline(src, llm, args.output, args.domain,
-                            args.max_pages, args.skip_validation,
-                            quality_target=qt)
-    else:
-        print(f"❌ Unknown source: {src}"); return None
 
 def main():
     p = argparse.ArgumentParser(
-        description="SkillForge v3 — Agentic research → skill file pipeline",
+        description="SkillForge v5 — Complete-Source + Anti-Hallucination",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Examples:
-  %(prog)s --github https://github.com/owner/repo
-  %(prog)s --arxiv 2103.13630
-  %(prog)s --arxiv 2103.13630 --provider openrouter
-  %(prog)s --arxiv 2103.13630 --provider openrouter --paid
-  %(prog)s --arxiv 2103.13630 --provider openrouter --paid --quality 9 --verify
-  %(prog)s batch --list sources.txt --provider openrouter
-""")
+        epilog=textwrap.dedent("""\
+            Examples:
+              skillforge_complete.py --url https://x402.org/ecosystem
+              skillforge_complete.py --github https://github.com/peacprotocol/peac
+              skillforge_complete.py --github https://github.com/ethereum/ERCs/pull/1170
+              skillforge_complete.py --arxiv 2511.15712
+              skillforge_complete.py batch --list sources.txt --annotate-skill --json
+        """),
+    )
     sub = p.add_subparsers(dest="command")
-    bp = sub.add_parser("batch", help="Batch process from file")
+    bp = sub.add_parser("batch", help="Batch from file")
     bp.add_argument("--list", required=True)
-    bp.add_argument("--delay", type=int, default=5)
+    bp.add_argument("--delay", type=int, default=3)
 
     for pr in [p, bp]:
-        pr.add_argument("--output","-o", default="./skills")
-        pr.add_argument("--provider", choices=["anthropic","gemini","openrouter"], default="anthropic")
+        pr.add_argument("--output", "-o", default="./skills")
+        pr.add_argument("--provider", choices=["anthropic","gemini","openrouter"],
+                        default="gemini")
         pr.add_argument("--model", default=None)
         pr.add_argument("--api-key", default=None)
-        pr.add_argument("--domain", default=None)
-        pr.add_argument("--max-file-kb", type=int, default=200)
-        pr.add_argument("--max-pages", type=int, default=40)
-        pr.add_argument("--token-budget", type=int, default=150000)
-        pr.add_argument("--skip-validation", action="store_true")
-        pr.add_argument("--no-llm", action="store_true")
-        pr.add_argument("--paid", action="store_true",
-                        help="Use cheap paid models via OpenRouter (~$0.01-0.10/paper)")
-        pr.add_argument("--quality", type=int, default=7, metavar="N",
-                        help="Quality target 1-10 (default: 7, use 9-10 with --paid)")
-        pr.add_argument("--verify", action="store_true",
-                        help="Run extra verification pass: re-check all equations and tables")
+        pr.add_argument("--max-input-chars", type=int, default=350_000)
+        pr.add_argument("--max-org-repos", type=int, default=25)
+        pr.add_argument("--crawl-pages", type=int, default=25,
+                        help="Max same-origin pages per web source (1 = no crawl)")
+        pr.add_argument("--clone-timeout", type=int, default=300,
+                        help="git clone timeout in seconds")
+        pr.add_argument("--no-submodules", action="store_true",
+                        help="Disable --recurse-submodules in git clone")
+        pr.add_argument("--max-repo-mb", type=int, default=800,
+                        help="Above this size, fall back to priority-filtered files")
+        pr.add_argument("--agentic-retries", type=int, default=2,
+                        help="Verifier-driven regeneration rounds (0 to disable)")
+        pr.add_argument("--target-pct-verified", type=float, default=90.0)
+        pr.add_argument("--no-llm", action="store_true",
+                        help="Download + persist only; skip generation")
+        pr.add_argument("--annotate-skill", action="store_true",
+                        help="Add inline ⚠ UNVERIFIED markers to SKILL.md")
+        pr.add_argument("--skip-verify", action="store_true")
+        pr.add_argument("--no-headless", action="store_true")
+        pr.add_argument("--json", dest="json_output", action="store_true",
+                        help="Emit one JSON line per result to stdout")
 
-    p.add_argument("--github", help="GitHub URL")
+    p.add_argument("--url", help="Any URL (HTML page, llms.txt, PDF, ...)")
+    p.add_argument("--github", help="GitHub URL: repo / blob / pull / org")
     p.add_argument("--arxiv", help="arXiv ID or URL")
     p.add_argument("--pdf", help="Local PDF path")
 
     args = p.parse_args()
 
-    # Validate quality range
-    if args.quality < 1 or args.quality > 10:
-        print("❌ --quality must be 1-10"); sys.exit(1)
-    if args.quality > 7 and not args.paid and args.provider == "openrouter":
-        print("⚠ Quality target >7 on free tier may require many retries. Consider --paid.")
+    opts = RunOptions(
+        output=args.output,
+        provider=args.provider,
+        model=args.model,
+        api_key=args.api_key,
+        max_input_chars=args.max_input_chars,
+        max_org_repos=args.max_org_repos,
+        crawl_pages=args.crawl_pages,
+        clone_timeout=args.clone_timeout,
+        recurse_submodules=not args.no_submodules,
+        max_repo_mb=args.max_repo_mb,
+        agentic_retries=args.agentic_retries,
+        target_pct_verified=args.target_pct_verified,
+        no_llm=args.no_llm,
+        annotate_skill=args.annotate_skill,
+        skip_verify=args.skip_verify,
+        headless=not args.no_headless,
+        json_output=args.json_output,
+    )
 
-    llm = None if args.no_llm else LLMProvider(args.provider, args.model, args.api_key, paid=args.paid)
+    web = WebDownloader(headless=opts.headless, crawl_pages=opts.crawl_pages)
+    gh = GitHubFetcher(clone_timeout=opts.clone_timeout,
+                       recurse_submodules=opts.recurse_submodules,
+                       max_repo_mb=opts.max_repo_mb)
+    arxiv = ArxivFetcher(web)
+    downloader = Downloader(web=web, gh=gh, arxiv=arxiv,
+                            max_org_repos=opts.max_org_repos,
+                            crawl_pages=opts.crawl_pages)
+    llm = None if opts.no_llm else LLMProvider(opts.provider, opts.model, opts.api_key)
 
-    # Verification pass setup
-    verify = getattr(args, 'verify', False)
-    qt = args.quality
+    Path(opts.output).mkdir(parents=True, exist_ok=True)
 
-    if args.command == "batch":
-        with open(args.list) as f:
-            srcs = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        print(f"\n{'═'*60}\n  SkillForge v4 Batch — {len(srcs)} sources\n{'═'*60}")
-        if qt != 7: print(f"  Quality target: {qt}/10")
-        results = []
-        for i, src in enumerate(srcs):
-            print(f"\n{'━'*50}\n  [{i+1}/{len(srcs)}] {src}\n{'━'*50}")
-            try:
-                out = process_one(src, llm, args)
-                if verify and out and llm:
-                    _verify_skill(out, llm)
-                results.append({"source":src,"output":out,"status":"ok"})
-            except Exception as e:
-                print(f"❌ {e}")
-                results.append({"source":src,"status":"fail","error":str(e)})
-            if i < len(srcs)-1 and llm: time.sleep(args.delay)
-        ok = sum(1 for r in results if r["status"]=="ok")
-        print(f"\n{'═'*60}\n  DONE: {ok}/{len(results)}\n{'═'*60}")
-        for r in results:
-            print(f"  {'✓' if r['status']=='ok' else '✗'} {r['source']}")
+    def _cleanup_on_exit():
+        try:
+            gh.cleanup()
+            arxiv.cleanup()
+        except Exception:
+            pass
+    atexit.register(_cleanup_on_exit)
 
-    elif args.github:
-        out = github_pipeline(args.github, llm, args.output, args.max_file_kb,
-                        args.token_budget, args.domain, args.skip_validation,
-                        quality_target=qt)
-        if verify and out and llm:
-            _verify_skill(out, llm)
-    elif args.arxiv:
-        pdf = download_arxiv(args.arxiv)
-        out = pdf_pipeline(pdf, llm, args.output, args.domain, args.max_pages,
-                     args.skip_validation, quality_target=qt)
-        if verify and out and llm:
-            _verify_skill(out, llm)
-    elif args.pdf:
-        if not os.path.exists(args.pdf): print(f"❌ Not found: {args.pdf}"); sys.exit(1)
-        out = pdf_pipeline(args.pdf, llm, args.output, args.domain, args.max_pages,
-                     args.skip_validation, quality_target=qt)
-        if verify and out and llm:
-            _verify_skill(out, llm)
-    else:
-        p.print_help(); sys.exit(1)
+    try:
+        if args.command == "batch":
+            with open(args.list) as f:
+                lines = [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+            specs = [detect_source(l) for l in lines]
+            banner(f"SkillForge v5 batch — {len(specs)} sources")
+            from collections import Counter
+            kc = Counter(s.kind for s in specs)
+            print("  Routing: " + ", ".join(f"{k}={v}" for k, v in kc.most_common()))
+            maybe_warn_github_auth(specs)
+
+            all_records = []
+            for i, spec in enumerate(specs, 1):
+                section(f"[{i}/{len(specs)}] {spec.kind}: {spec.raw}")
+                try:
+                    recs = process_spec(spec, opts, downloader, llm)
+                    all_records.extend(recs)
+                except KeyboardInterrupt:
+                    print("\n⛔ Interrupted by user"); break
+                except Exception as e:
+                    print(f"❌ {type(e).__name__}: {e}")
+                    rec = {"raw": spec.raw, "kind": spec.kind,
+                           "status": "error", "error": str(e)}
+                    emit_json_result(opts, rec)
+                    all_records.append(rec)
+                if i < len(specs) and llm:
+                    time.sleep(args.delay)
+            ok = sum(1 for r in all_records if r.get("status") == "ok")
+            raw = sum(1 for r in all_records if r.get("status") == "raw_only")
+            err = sum(1 for r in all_records if r.get("status") == "error")
+            banner(f"DONE: {ok} ok, {raw} raw-only, {err} errored")
+            for r in all_records:
+                m = {"ok":"✓","raw_only":"○","error":"✗",
+                     "skipped":"⏭","empty_llm":"✗"}.get(r.get("status"), "?")
+                pv = ""
+                if "pct_verified" in r and r["pct_verified"] >= 0:
+                    pv = f"  ({r['pct_verified']}% verified)"
+                err_s = ""
+                if r.get("status") == "error":
+                    err_s = f"  — {r.get('error', '')[:60]}"
+                print(f"  {m} [{r.get('kind','?'):<14}] {r.get('raw','?')}{pv}{err_s}")
+            return
+
+        spec = None
+        if args.github:
+            spec = detect_source(args.github)
+        elif args.arxiv:
+            spec = detect_source(args.arxiv)
+        elif args.url:
+            spec = detect_source(args.url)
+        elif args.pdf:
+            if not os.path.exists(args.pdf):
+                print(f"❌ Not found: {args.pdf}"); sys.exit(1)
+            spec = SourceSpec(args.pdf, "pdf", args.pdf)
+        else:
+            p.print_help(); sys.exit(1)
+
+        if not spec or spec.kind in ("skip","unknown"):
+            print(f"❌ Unrecognized source: {spec.raw if spec else '?'}")
+            sys.exit(1)
+        maybe_warn_github_auth([spec])
+        process_spec(spec, opts, downloader, llm)
+
+    finally:
+        _cleanup_on_exit()
+
 
 if __name__ == "__main__":
     main()

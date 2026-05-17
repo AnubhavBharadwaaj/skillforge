@@ -1,3 +1,18 @@
+# Core LLM providers (any one is enough at runtime)
 anthropic>=0.40.0
-PyMuPDF>=1.24.0
 google-generativeai>=0.8.0
+openai>=1.50.0          # only needed when --provider openrouter
+
+# PDF + arXiv
+PyMuPDF>=1.24.0
+
+# Web fetching (used by skillforge_complete.py)
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+html2text>=2024.2.26
+lxml>=5.0.0             # faster HTML parser; falls back to html.parser if missing
+
+# Headless browser for dynamic / JS-rendered docs sites (GitBook, Docusaurus, etc.)
+# Skip if you don't need SPA support — code falls back to requests automatically.
+# After install: `playwright install chromium`
+playwright>=1.40.0
