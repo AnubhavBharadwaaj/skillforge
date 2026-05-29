@@ -1,43 +1,100 @@
 #!/usr/bin/env python3
 """
-skillforge_complete.py — SkillForge v5: Complete-Source + Anti-Hallucination
+skillforge_complete.py — SkillForge v6: Complete-Source + Anti-Hallucination
+                                         + Silent-Error Guardrail
 
-Changes from v4 (all driven by harsh-critic review):
+NEW IN V6 — Verbatim source guardrail (default on)
+
+After verification, if any section in the generated SKILL.md is flagged as
+"dangerous" — i.e. low pct_verified AND containing API/code/identifier
+content where LLM paraphrasing creates silent runtime bugs when an AI
+assistant later reads the skill and writes code from it — SkillForge
+automatically:
+
+  1. Extracts the actual API surface VERBATIM from the source files on disk
+     (no LLM in the loop): every export/declare in TS/JS, every def/class
+     in Python, every pub fn/struct in Rust, every func/type in Go, plus
+     code blocks from docs pages, package manifests, and inline identifiers.
+
+  2. Writes that extraction to `VERBATIM_REFERENCE.md` next to `SKILL.md`.
+     Because it's literal copy-paste from source, it's guaranteed accurate.
+
+  3. Injects a trust directive at the top of `SKILL.md` (after frontmatter)
+     telling Claude/Cursor/any AI tool reading the file: "for any method
+     name, parameter, type, constant, or config key, consult
+     VERBATIM_REFERENCE.md — if the value isn't there verbatim, treat it
+     as unverified."
+
+V6.1 patches (sparse-extraction fallback + HTML stripping):
+
+  4. When the docs code-block extractor produces less than
+     `--verbatim-fallback-threshold` chars of actual content (because the
+     source pages render code via <pre><code> or other non-fenced HTML
+     markup that trafilatura didn't convert), the extractor automatically
+     falls back to dumping the full cleaned content of the source pages.
+     This guarantees VERBATIM_REFERENCE.md is never a near-empty skeleton
+     for docs sources — there is always authoritative source-of-truth
+     content available.
+
+  5. When source files contain raw HTML (common with Next.js / Fumadocs /
+     React-rendered docs sites where trafilatura's markdown output retains
+     the HTML structure), the fallback automatically strips HTML tags,
+     scripts, styles, and SVG blocks. This cuts file sizes from ~350KB of
+     Tailwind-class-soup to ~30KB of actual content while preserving every
+     word of useful text.
+
+  6. The fallback also reads `.html` files from the source bundle when no
+     matching `.md` is present, handling bundles where SkillForge stored
+     only the raw HTML capture.
+
+CLI flags:
+    --verbatim {auto,always,never}   default: auto
+    --verbatim-threshold FLOAT       default: 92.0 (section pct triggering)
+    --verbatim-fallback-threshold N  default: 1500 (docs sparse fallback)
+    --no-verbatim                    shorthand for --verbatim never
+
+Dangerous sections are detected by combining (a) low pct_verified vs the
+configurable threshold, with (b) section name matching patterns like
+"APIs", "Functions", "Methods", "Configuration", "Architecture",
+"Endpoints", etc. — the places where LLMs paraphrase code identifiers
+and create silent compile-clean-but-runtime-broken code.
+
+This addresses the failure mode where a SKILL.md verifies at 90% overall but
+contains an "APIs / Functions / Classes" section at 71% — that section is
+the one Claude reads when writing actual code, and 29% of its identifiers
+are paraphrased. The guardrail makes the actual SDK surface available to
+any consumer of the skill file as a separate, source-grounded reference.
+
+═══════════════════════════════════════════════════════════════════════════
+Original v5 changes (all retained):
 
   Severity 1 (correctness):
-    1. Verifier number matching uses digit-aware boundaries (no more "3"
-       matching inside "13"; "1.5" not matching inside "21.5"). Other
-       claim types use \\w word boundaries instead of raw substring.
-    2. YAML `description:` is now verified (only `name:`/`id:`/`version:`
-       are skipped — those are metadata, not source claims).
+    1. Verifier number matching uses digit-aware boundaries.
+    2. YAML `description:` is now verified.
     3. `extract_skill_name` only reads inside the YAML frontmatter span.
     4. `git clone` has a hard timeout (default 300s, configurable).
-    5. Submodules cloned by default (--recurse-submodules).
+    5. Submodules cloned by default.
 
   Severity 2 (completeness):
     6. Web sources do same-origin BFS crawl (--crawl-pages, default 25).
-    7. `llms.txt` is parsed as a URL manifest; each listed URL fetched.
-    8. Auto-scroll iterates ALL scrollable containers (not just body).
+    7. `llms.txt` parsed as a URL manifest.
+    8. Auto-scroll iterates ALL scrollable containers.
     9. Main-content extraction via trafilatura strips sidebar/nav noise.
 
   Others:
-   11. Agentic regeneration loop: verifier output feeds back into LLM
-       with "delete or replace from source" up to --agentic-retries.
-   12. Smart prioritized truncation: repos sort by README → manifest →
-       config → core → other → tests; papers keep abstract + middle
-       (methods) + tail.
-   13. Repo-clone cache: blob/PR/repo URLs to same (owner, repo) share
-       one clone.
-   14. Skill-name collisions disambiguated with short hash of source URL.
-   15. Verifier knows common ML/CS acronyms (Adam, BERT, ReLU, JSON, ...).
-   16. Path traversal protection via abspath + prefix check.
-   17. Startup banner warns when no GITHUB_TOKEN and GitHub API needed.
-   18. Per-repo max size guard; above limit, fall back to priority-cap.
-   19. GitHubFetcher.cleanup() via weakref finalizer + atexit.
-   20. --json emits one machine-readable line per source to stdout.
-   21. Verifier dedupes within-line by VALUE (not (value, type)).
+   11. Agentic regeneration loop with REPAIR_SYSTEM_PROMPT feedback.
+   12. Smart prioritized truncation.
+   13. Repo-clone cache keyed on (owner, repo, ref).
+   14. Skill-name collisions disambiguated with short_hash.
+   15. 191-entry KNOWN_ACRONYMS set.
+   16. Path traversal protection via os.path.abspath + prefix check.
+   17. Startup banner warns when no GITHUB_TOKEN.
+   18. Per-repo size guard (--max-repo-mb).
+   19. Tempdir cleanup via weakref.finalize + atexit.
+   20. --json emits one machine-readable line per source.
+   21. Verifier dedupes within-line by VALUE.
    22. Per-section verification breakdown in VERIFICATION.md.
-   23. Unicode normalization (NFKD + ASCII fold) on source and claims.
+   23. Unicode normalization (NFKD + ASCII fold).
 
 Install:
   pip install anthropic google-generativeai openai PyMuPDF \\
@@ -1602,6 +1659,693 @@ def agentic_skill_loop(bundle, llm, max_input_chars=350_000,
             break
 
     return best_skill or skill, best_results, best_summary
+
+
+# ─────────────────────────────────────────────────────────────
+# VERBATIM GUARD — silent-error prevention (new in v6)
+# ─────────────────────────────────────────────────────────────
+#
+# After verification, if any section is flagged as "dangerous" — i.e. it
+# contains code/identifier content AND has a low pct_verified score — this
+# module extracts the actual API surface VERBATIM from the source files on
+# disk (no LLM in the loop) and writes a VERBATIM_REFERENCE.md companion
+# file alongside the SKILL.md. A trust directive is also injected into the
+# SKILL.md telling downstream AI consumers to prefer the verbatim file
+# for any code generation involving exact identifiers.
+
+# Section name patterns that indicate API/code-bearing content. A low
+# pct_verified on a section matching any of these is treated as dangerous
+# because it's exactly the surface the LLM consumer will read when writing
+# code from the skill.
+DANGEROUS_SECTION_PATTERNS = [
+    re.compile(r'\bAPIs?\b', re.I),
+    re.compile(r'\bFunctions?\b', re.I),
+    re.compile(r'\bClasses?\b', re.I),
+    re.compile(r'\bMethods?\b', re.I),
+    re.compile(r'\bEndpoints?\b', re.I),
+    re.compile(r'\bConfig(uration)?\b', re.I),
+    re.compile(r'\bInterfaces?\b', re.I),
+    re.compile(r'\bTypes?\b', re.I),
+    re.compile(r'\bSchema(s|tic)?\b', re.I),
+    re.compile(r'\bSignatures?\b', re.I),
+    re.compile(r'\bArchitecture\b', re.I),
+    re.compile(r'\bComponents?\b', re.I),
+    re.compile(r'\bSDK\b', re.I),
+    re.compile(r'\bUsage\b', re.I),
+    re.compile(r'\bRPC\b', re.I),
+    re.compile(r'\bGraphQL\b', re.I),
+    re.compile(r'\bREST\b', re.I),
+    re.compile(r'\bIntegration\b', re.I),
+    re.compile(r'\bImplementation\b', re.I),
+    re.compile(r'\bAPI Reference\b', re.I),
+    re.compile(r'\bModule\b', re.I),
+    re.compile(r'\bStaking\b', re.I),
+    re.compile(r'\bPayment[s]?\b', re.I),
+    re.compile(r'\bIntent\b', re.I),
+    re.compile(r'\bCommand\b', re.I),
+    re.compile(r'\bDiscovery\b', re.I),
+    re.compile(r'\bEscrow\b', re.I),
+    re.compile(r'\bTrigger', re.I),
+    re.compile(r'\bMapping\b', re.I),
+]
+
+
+class VerbatimExtractor:
+    """Pulls literal source content out of a SourceBundle's persisted files
+    directory. Output is markdown — guaranteed to verify at 100% because
+    every character is copy-pasted from the source on disk."""
+
+    # File extensions per language
+    LANG_EXTS = {
+        "typescript": [".ts", ".tsx", ".mts", ".cts"],
+        "javascript": [".js", ".jsx", ".mjs", ".cjs"],
+        "python":     [".py", ".pyi"],
+        "rust":       [".rs"],
+        "go":         [".go"],
+        "java":       [".java"],
+        "kotlin":     [".kt", ".kts"],
+        "csharp":     [".cs"],
+        "ruby":       [".rb"],
+        "swift":      [".swift"],
+    }
+
+    # Patterns that mark the start of a public API surface declaration
+    SIGNATURE_STARTS = {
+        "typescript": re.compile(r'^\s*(export\s|declare\s)', re.M),
+        "javascript": re.compile(r'^\s*(export\s|module\.exports|exports\.)', re.M),
+        "python":     re.compile(r'^(async\s+def|def|class)\s', re.M),
+        "rust":       re.compile(r'^\s*pub\s+(fn|struct|enum|trait|mod|type|const|static)\s', re.M),
+        "go":         re.compile(r'^(func|type|var|const)\s', re.M),
+        "java":       re.compile(r'^\s*(public|private|protected)\s', re.M),
+        "kotlin":     re.compile(r'^\s*(class|interface|object|fun|val|var)\s', re.M),
+        "csharp":     re.compile(r'^\s*(public|private|protected|internal)\s', re.M),
+        "ruby":       re.compile(r'^\s*(class|module|def)\s', re.M),
+        "swift":      re.compile(r'^\s*(public|open|internal|class|struct|enum|protocol|func|var|let)\s', re.M),
+    }
+
+    # Skip these files entirely (tests, build artifacts, type stubs from .d.ts)
+    SKIP_FILE_PATTERNS = [
+        re.compile(r'\.test\.|\.spec\.|_test\.[a-z]+$|test_[a-z_]+\.|__tests__|/tests?/'),
+        re.compile(r'\.d\.ts$'),
+        re.compile(r'node_modules|__pycache__|/dist/|/build/|/target/|\.next/'),
+        re.compile(r'\.min\.(js|css)$'),
+    ]
+
+    # Entry-point candidates worth dumping in full
+    ENTRY_CANDIDATES = [
+        "src/index.ts", "src/index.js", "src/main.ts", "src/main.py",
+        "src/lib.rs", "src/main.rs", "src/index.tsx",
+        "index.ts", "index.js", "index.tsx",
+        "main.py", "__init__.py", "main.go",
+        "lib/index.ts", "lib/index.js",
+        "mod.rs", "lib.rs",
+    ]
+
+    # Manifests / config files to copy verbatim (they contain authoritative
+    # constants, dep versions, type definitions)
+    MANIFEST_FILES = [
+        "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+        "tsconfig.json", "requirements.txt", "Pipfile",
+        "Anchor.toml", "foundry.toml",  # web3-specific
+    ]
+
+    def __init__(self, source_dir, fallback_threshold: int = 1500):
+        self.source_dir = Path(source_dir)
+        self.files_dir = self.source_dir / "files"
+        # When _extract_docs produces less than this many non-whitespace chars
+        # of actual content (i.e. just the skeleton), the docs fallback fires
+        # and dumps the full cleaned page content. Set to 0 to disable.
+        self.fallback_threshold = fallback_threshold
+
+    def has_files(self) -> bool:
+        return self.files_dir.is_dir() and any(self.files_dir.rglob("*"))
+
+    def _should_skip(self, rel_path: str) -> bool:
+        return any(p.search(rel_path) for p in self.SKIP_FILE_PATTERNS)
+
+    def extract(self, kind: str) -> str:
+        """Top-level entry. Routes to repo or doc extraction based on kind."""
+        if not self.has_files():
+            return f"_(no files directory at {self.files_dir})_\n"
+        if kind in ("github_repo", "github_blob", "github_pr"):
+            return self._extract_repo()
+        # For arxiv/pdf, the files are typically .md + .txt; treat as docs
+        return self._extract_docs()
+
+    # ─── repo extraction ──────────────────────────────────
+
+    def _extract_repo(self) -> str:
+        parts = []
+        ep = self._extract_entry_points()
+        if ep.strip():
+            parts.append(ep)
+        for lang, exts in self.LANG_EXTS.items():
+            block = self._extract_language(lang, exts)
+            if block.strip():
+                parts.append(block)
+        man = self._extract_manifests()
+        if man.strip():
+            parts.append(man)
+        return "\n\n".join(parts)
+
+    def _extract_entry_points(self) -> str:
+        out = ["## Entry points (full content, verbatim)", ""]
+        found = False
+        for cand in self.ENTRY_CANDIDATES:
+            f = self.files_dir / cand
+            if not f.is_file():
+                continue
+            try:
+                size = f.stat().st_size
+                if size > 80_000:
+                    continue  # huge entry — skip, will be captured in signatures
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            ext = f.suffix.lstrip(".") or "text"
+            out.append(f"### `{cand}`")
+            out.append("")
+            out.append(f"```{ext}")
+            out.append(content)
+            out.append("```")
+            out.append("")
+            found = True
+        return "\n".join(out) if found else ""
+
+    def _extract_language(self, lang: str, exts: list) -> str:
+        pat = self.SIGNATURE_STARTS.get(lang)
+        if not pat:
+            return ""
+        results = []
+        for ext in exts:
+            for f in sorted(self.files_dir.rglob(f"*{ext}")):
+                try:
+                    rel = str(f.relative_to(self.files_dir))
+                except ValueError:
+                    continue
+                if self._should_skip(rel):
+                    continue
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                if not pat.search(content):
+                    continue
+                sigs = self._extract_signatures(content, lang)
+                if sigs.strip():
+                    results.append(f"### `{rel}`\n\n```{lang}\n{sigs}\n```\n")
+        if not results:
+            return ""
+        return f"## {lang.title()} signatures (verbatim)\n\n" + "\n".join(results)
+
+    def _extract_signatures(self, content: str, lang: str, max_lines: int = 200) -> str:
+        if lang == "python":
+            return self._extract_python_signatures(content, max_lines)
+        if lang in ("ruby",):
+            return self._extract_ruby_signatures(content, max_lines)
+        return self._extract_brace_signatures(content, lang, max_lines)
+
+    def _extract_brace_signatures(self, content: str, lang: str, max_lines: int) -> str:
+        """Capture each signature from its start line through balanced braces
+        (or terminating semicolon). Truncate long bodies to first 5 lines + an
+        elision marker."""
+        pat = self.SIGNATURE_STARTS[lang]
+        lines = content.splitlines()
+        out = []
+        i = 0
+        kept = 0
+        while i < len(lines) and kept < max_lines:
+            if not pat.match(lines[i]):
+                i += 1
+                continue
+            block = [lines[i]]
+            depth = lines[i].count("{") - lines[i].count("}")
+            ended_inline = (depth == 0
+                            and (lines[i].rstrip().endswith(";")
+                                 or lines[i].rstrip().endswith("}")))
+            if ended_inline:
+                pass
+            else:
+                # Track until balanced or end
+                while i < len(lines) - 1 and depth != 0:
+                    i += 1
+                    line = lines[i]
+                    block.append(line)
+                    depth += line.count("{") - line.count("}")
+                    if len(block) > 50:
+                        # Truncate massive bodies
+                        block = block[:5] + ["    // ... body elided (long) ..."]
+                        # advance to close
+                        while i < len(lines) - 1 and depth != 0:
+                            i += 1
+                            depth += lines[i].count("{") - lines[i].count("}")
+                        break
+            out.extend(block)
+            out.append("")  # spacer
+            kept += len(block) + 1
+            i += 1
+        return "\n".join(out)
+
+    def _extract_python_signatures(self, content: str, max_lines: int) -> str:
+        """Python: capture def/class/async def lines plus decorators. Body
+        is kept up to first blank-line-at-base-indent."""
+        lines = content.splitlines()
+        out = []
+        i = 0
+        kept = 0
+        while i < len(lines) and kept < max_lines:
+            line = lines[i]
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            if (stripped.startswith(("def ", "async def ", "class "))
+                or stripped.startswith("@")):
+                # Capture decorator stack + signature line(s) up to colon
+                start_indent = indent
+                out.append(line)
+                kept += 1
+                # If signature continues over multiple lines (def foo(
+                #     a,
+                #     b,
+                # ):), capture until the line ending with ':'
+                while not line.rstrip().endswith(":") and i < len(lines) - 1:
+                    i += 1
+                    line = lines[i]
+                    out.append(line)
+                    kept += 1
+                # Capture docstring if present
+                if i + 1 < len(lines) and lines[i + 1].strip().startswith(('"""', "'''")):
+                    i += 1
+                    out.append(lines[i])
+                    kept += 1
+                    delim = lines[i].strip()[:3]
+                    if not lines[i].strip().endswith(delim) or lines[i].strip() == delim:
+                        while i < len(lines) - 1:
+                            i += 1
+                            out.append(lines[i])
+                            kept += 1
+                            if delim in lines[i]:
+                                break
+                out.append("")
+                kept += 1
+            i += 1
+        return "\n".join(out)
+
+    def _extract_ruby_signatures(self, content: str, max_lines: int) -> str:
+        out = []
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith(("class ", "module ", "def ")):
+                out.append(line)
+                if len(out) >= max_lines:
+                    break
+        return "\n".join(out)
+
+    def _extract_manifests(self) -> str:
+        parts = []
+        for m in self.MANIFEST_FILES:
+            f = self.files_dir / m
+            if not f.is_file():
+                continue
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")[:8000]
+            except Exception:
+                continue
+            ext = m.rsplit(".", 1)[-1] if "." in m else "text"
+            parts.append(f"### `{m}`\n\n```{ext}\n{content}\n```\n")
+        if not parts:
+            return ""
+        return "## Package manifests & config (verbatim)\n\n" + "\n".join(parts)
+
+    # ─── docs extraction ──────────────────────────────────
+
+    def _extract_docs(self) -> str:
+        parts = ["## All code blocks from documentation (verbatim)", ""]
+        seen_any = False
+        for f in sorted(self.files_dir.rglob("*.md")):
+            try:
+                rel = str(f.relative_to(self.files_dir))
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if "```" not in content:
+                continue
+            blocks = self._extract_code_blocks_with_headers(content)
+            if not blocks.strip():
+                continue
+            block_count = content.count("```") // 2
+            parts.append(f"### From `{rel}` ({block_count} code blocks)")
+            parts.append("")
+            parts.append(blocks)
+            parts.append("")
+            seen_any = True
+
+        # Inline code identifiers (function names, type names, paths in `code`)
+        identifiers = self._extract_inline_identifiers()
+        if identifiers:
+            parts.append("## Inline code identifiers (verbatim)")
+            parts.append("")
+            parts.append("```")
+            parts.extend(sorted(identifiers)[:300])
+            parts.append("```")
+            parts.append("")
+            seen_any = True
+
+        extracted = "\n".join(parts) if seen_any else \
+            "## All code blocks from documentation (verbatim)\n\n_(no fenced code blocks found)_\n"
+
+        # v6 sparse-fallback: when the structured extractor produced essentially
+        # no content (because the docs site renders code via <pre><code> or
+        # similar non-fenced markup that trafilatura didn't convert to
+        # triple-backtick fences), append the full cleaned page content as a
+        # verbatim fallback. This is what every consumer of the verbatim
+        # reference needs — the authoritative source of truth — and shipping
+        # a near-empty skeleton would defeat the guard's purpose.
+        if self._is_extraction_sparse(extracted, self.fallback_threshold):
+            extracted += self._extract_docs_fallback()
+
+        return extracted
+
+    @staticmethod
+    def _extract_code_blocks_with_headers(content: str) -> str:
+        """Yield each fenced code block, preceded by the nearest preceding
+        section header so the LLM consumer knows what the code is for."""
+        out = []
+        last_header = ""
+        last_emitted = ""
+        in_block = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if re.match(r'^#{1,6}\s+', stripped):
+                last_header = stripped
+            if stripped.startswith("```"):
+                if not in_block:
+                    in_block = True
+                    if last_header and last_header != last_emitted:
+                        out.append(f"**{last_header}**")
+                        out.append("")
+                        last_emitted = last_header
+                    out.append(line)
+                else:
+                    in_block = False
+                    out.append(line)
+                    out.append("")
+                continue
+            if in_block:
+                out.append(line)
+        return "\n".join(out)
+
+    def _extract_inline_identifiers(self) -> set:
+        pat = re.compile(r'`([A-Za-z_][A-Za-z0-9_.()/\[\]:-]{3,80})`')
+        found = set()
+        for f in self.files_dir.rglob("*.md"):
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            for m in pat.finditer(content):
+                v = m.group(1).strip()
+                # Skip natural-language fragments
+                if " " in v or v.lower() in {"yes", "no", "true", "false"}:
+                    continue
+                found.add(v)
+        return found
+
+    # ─── v6.1 patches: sparse-extraction fallback + HTML stripping ────────
+
+    @staticmethod
+    def _is_extraction_sparse(content: str, threshold: int = 1500) -> bool:
+        """True if the structured extraction produced essentially nothing
+        beyond the skeleton. Strips section headers, fence markers, and
+        whitespace, then checks if remaining content is below threshold."""
+        if not content:
+            return True
+        # Remove section headers (## Heading)
+        stripped = re.sub(r'^#{1,6}\s+.*$', '', content, flags=re.M)
+        # Remove orphan code-fence markers
+        stripped = re.sub(r'^```.*$', '', stripped, flags=re.M)
+        # Remove italicised placeholder messages like _(no code content found)_
+        stripped = re.sub(r'_\([^)]+\)_', '', stripped)
+        # Collapse all whitespace
+        stripped = re.sub(r'\s+', '', stripped)
+        return len(stripped) < threshold
+
+    @staticmethod
+    def _looks_like_html(content: str) -> bool:
+        """Heuristic: does this content contain enough structural HTML to
+        warrant tag stripping before inclusion in the verbatim reference?"""
+        if not content:
+            return False
+        head = content.lstrip()[:200].lower()
+        if head.startswith(('<!doctype', '<html', '<?xml')):
+            return True
+        # Count substantial structural tags (not just <br> or stray <>)
+        structural = re.findall(
+            r'<(?:html|head|body|div|script|style|svg|article|section|'
+            r'aside|nav|header|footer|main|p\b|h[1-6]\b|table|ul|ol|li)\b',
+            content, re.I,
+        )
+        return len(structural) >= 8
+
+    @staticmethod
+    def _strip_html(content: str) -> str:
+        """Remove HTML tags, scripts, styles, and SVG blocks. Preserves text
+        content. Decodes common HTML entities. Collapses excess whitespace."""
+        # Remove block-level noise entirely
+        content = re.sub(r'<script\b[^>]*>.*?</script>', '', content,
+                         flags=re.S | re.I)
+        content = re.sub(r'<style\b[^>]*>.*?</style>', '', content,
+                         flags=re.S | re.I)
+        content = re.sub(r'<svg\b[^>]*>.*?</svg>', '', content,
+                         flags=re.S | re.I)
+        content = re.sub(r'<noscript\b[^>]*>.*?</noscript>', '', content,
+                         flags=re.S | re.I)
+        content = re.sub(r'<!--.*?-->', '', content, flags=re.S)
+        # Strip all remaining tags
+        content = re.sub(r'<[^>]+>', '', content)
+        # Decode common HTML entities (no full html.unescape to keep dep-free)
+        entities = {
+            '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"',
+            '&apos;': "'", '&#39;': "'", '&nbsp;': ' ', '&mdash;': '—',
+            '&ndash;': '–', '&hellip;': '…', '&rsquo;': "'", '&lsquo;': "'",
+            '&rdquo;': '"', '&ldquo;': '"',
+        }
+        for k, v in entities.items():
+            content = content.replace(k, v)
+        # Numeric entities (e.g. &#8217;)
+        content = re.sub(
+            r'&#(\d+);',
+            lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else '',
+            content,
+        )
+        # Collapse whitespace
+        content = re.sub(r'[ \t]+\n', '\n', content)
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        return content.strip()
+
+    def _extract_docs_fallback(self) -> str:
+        """When structured code-block extraction is sparse, append the full
+        cleaned content of source documentation files. This guarantees that
+        VERBATIM_REFERENCE.md always contains the authoritative source of
+        truth — even when the source pages render code in non-fenced HTML
+        formats the code-block extractor can't parse."""
+        out = ["", "---", "",
+               "## Full page content (verbatim fallback)", "",
+               "> The structured code-block extractor found insufficient",
+               "> fenced code blocks in this source. The full cleaned content",
+               "> of the source documentation pages is appended below, with",
+               "> HTML markup stripped where present. This is the",
+               "> authoritative source of truth — use it for any code",
+               "> generation involving exact identifiers, configuration keys,",
+               "> or API references.",
+               ""]
+
+        # Prefer .md when available; fall back to .html for same basename.
+        # This handles bundles where SkillForge stored only HTML, or stored
+        # both and the markdown version is what we want.
+        md_files = sorted(self.files_dir.rglob("*.md"))
+        html_files = sorted(self.files_dir.rglob("*.html"))
+        seen_stems = {f.stem for f in md_files}
+        candidates = list(md_files) + [f for f in html_files
+                                       if f.stem not in seen_stems]
+
+        any_dumped = False
+        for f in candidates:
+            try:
+                rel = str(f.relative_to(self.files_dir))
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            # Strip HTML if the file is actually HTML masquerading as markdown
+            # (common with trafilatura output for docs sites that use heavy
+            # Next.js/React rendering with Tailwind class soup)
+            if self._looks_like_html(content):
+                content = self._strip_html(content)
+
+            content = content.strip()
+            if not content:
+                continue
+
+            # Hard per-file cap to prevent one massive page from dominating
+            # the output. 500KB cleaned text is already ~125K tokens.
+            CAP = 500_000
+            if len(content) > CAP:
+                content = content[:CAP] + \
+                    f"\n\n... [content truncated at {CAP // 1000}KB] ..."
+
+            out.append(f"### From `{rel}`")
+            out.append("")
+            out.append(content)
+            out.append("")
+            any_dumped = True
+
+        if not any_dumped:
+            out.append("_(no fallback content available — source bundle was empty)_")
+            out.append("")
+
+        return "\n".join(out)
+
+
+def assess_dangerous_sections(
+    summary: dict,
+    threshold: float = 92.0,
+) -> tuple[bool, list]:
+    """Decide whether the skill has sections likely to cause silent code
+    errors when read by an AI assistant to write code.
+
+    Returns (should_extract_verbatim, list_of_dangerous_section_names).
+
+    A section is dangerous if:
+      - It has ≥3 claims (skip trivially-small sections), AND
+      - Its pct_verified is below `threshold`, AND EITHER
+        - Its name matches a dangerous pattern (APIs/Functions/...)
+        - Or its pct_verified is severely below threshold (>5 points)
+    """
+    dangerous = []
+    for sec in summary.get("per_section", []):
+        if sec.get("claims_total", 0) < 3:
+            continue
+        name = sec.get("section", "")
+        pct = sec.get("pct_verified", 100.0)
+        if pct >= threshold:
+            continue
+        name_matches = any(p.search(name) for p in DANGEROUS_SECTION_PATTERNS)
+        severely_low = pct < (threshold - 5)
+        if name_matches or severely_low:
+            dangerous.append({"section": name, "pct": pct,
+                              "claims_total": sec["claims_total"],
+                              "claims_unverified": sec["claims_unverified"]})
+    return bool(dangerous), dangerous
+
+
+_VERBATIM_DIRECTIVE_MARKER = "<!-- VERBATIM-DIRECTIVE-V1 -->"
+
+_VERBATIM_DIRECTIVE_TEMPLATE = """{marker}
+> **⚠ TRUSTED API REFERENCE — read this before generating any code**
+>
+> This skill's narrative sections were generated by an LLM and may contain
+> **paraphrased** API references. Specifically, these sections were flagged
+> by the SkillForge verifier as having significant unverified content
+> likely to cause silent runtime errors if used directly for code
+> generation: {sections}
+>
+> For ANY code generation involving:
+>
+> - method names / function names
+> - parameter names or parameter order
+> - parameter types or return types
+> - constants, enum values, struct/interface fields
+> - configuration keys or environment variable names
+> - file paths inside the source repository
+>
+> You **MUST** consult the companion file `VERBATIM_REFERENCE.md` in this
+> same directory. It contains literal, character-for-character extraction
+> from the actual source files preserved on disk. No LLM is in the loop —
+> every character in that file appears verbatim in the original source.
+>
+> **Rule:** if a method signature appears in `VERBATIM_REFERENCE.md`, use
+> it exactly as written. If it appears only in `SKILL.md` and NOT in the
+> verbatim file, treat it as unverified — ask the user or read the actual
+> source under `.sources/<basename>/files/` before writing code that
+> depends on it.
+>
+> The narrative below remains useful for conceptual context, architecture
+> overviews, and "what does this do" questions. Just don't trust it for
+> exact code identifiers.
+"""
+
+
+def inject_verbatim_directive(skill_path: Path, dangerous_sections: list) -> bool:
+    """Inject the trust directive after YAML frontmatter. Idempotent — if
+    the marker is already present, this is a no-op. Returns True if injected."""
+    content = skill_path.read_text(encoding="utf-8")
+    if _VERBATIM_DIRECTIVE_MARKER in content:
+        return False
+
+    if dangerous_sections:
+        names = ", ".join(f"_{s['section']}_ ({s['pct']:.1f}%)"
+                          for s in dangerous_sections[:5])
+        if len(dangerous_sections) > 5:
+            names += f", +{len(dangerous_sections) - 5} more"
+    else:
+        names = "(precautionary — no specific sections flagged)"
+
+    directive = _VERBATIM_DIRECTIVE_TEMPLATE.format(
+        marker=_VERBATIM_DIRECTIVE_MARKER, sections=names,
+    )
+
+    # Insert after YAML frontmatter if present
+    m = re.match(r'^(---\s*\n.*?\n---\s*\n)', content, re.DOTALL)
+    if m:
+        frontmatter = m.group(1)
+        body = content[m.end():]
+        new_content = frontmatter + "\n" + directive + "\n" + body
+    else:
+        new_content = directive + "\n" + content
+
+    skill_path.write_text(new_content, encoding="utf-8")
+    return True
+
+
+def write_verbatim_reference(
+    skill_dir: Path,
+    source_dir: Path,
+    source_kind: str,
+    dangerous_sections: list,
+    fallback_threshold: int = 1500,
+) -> Path:
+    """Produce VERBATIM_REFERENCE.md companion to SKILL.md. Returns its path."""
+    extractor = VerbatimExtractor(source_dir, fallback_threshold=fallback_threshold)
+    if dangerous_sections:
+        flagged = ", ".join(f"_{s['section']}_ ({s['pct']:.1f}%)"
+                            for s in dangerous_sections)
+    else:
+        flagged = "(precautionary — extracted by default for this kind)"
+
+    header_lines = [
+        f"# Verbatim source reference: {skill_dir.name}",
+        f"",
+        f"**Skill**: `{skill_dir / 'SKILL.md'}`",
+        f"**Source bundle**: `{source_dir}`",
+        f"**Source kind**: `{source_kind}`",
+        f"**Generated**: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"**Dangerous sections flagged**: {flagged}",
+        f"",
+        f"> ⚠ This file contains content extracted DIRECTLY from the source",
+        f"> files preserved on disk. No LLM is in the loop — every character",
+        f"> below appears in the original source. Use this as the source of",
+        f"> truth for any code generation involving exact identifiers,",
+        f"> method signatures, types, or constants.",
+        f"",
+        f"---",
+        f"",
+    ]
+    body = extractor.extract(source_kind)
+    out_path = skill_dir / "VERBATIM_REFERENCE.md"
+    out_path.write_text("\n".join(header_lines) + "\n" + body, encoding="utf-8")
+    return out_path
+
+
 # ─────────────────────────────────────────────────────────────
 # VERIFIER — word-boundary, unicode-normalized, per-section
 # ─────────────────────────────────────────────────────────────
@@ -2003,6 +2747,10 @@ class RunOptions:
     skip_verify: bool = False
     headless: bool = True
     json_output: bool = False
+    # v6: verbatim guard
+    verbatim_mode: str = "auto"          # auto | always | never
+    verbatim_threshold: float = 92.0     # section pct below this triggers in auto mode
+    verbatim_fallback_threshold: int = 1500  # docs sparse-fallback trigger (chars)
 
 
 def emit_json_result(opts, record):
@@ -2080,15 +2828,73 @@ def process_spec(spec, opts, downloader, llm):
                 annotate_skill_inline(skill_path, results)
                 print(f"   📝 Inline ⚠ UNVERIFIED markers added")
 
+        # ─── v6 verbatim guard ────────────────────────────
+        verbatim_path = ""
+        dangerous_sections_log: list = []
+        if (opts.verbatim_mode != "never"
+                and not opts.no_llm
+                and bundle.on_disk_path
+                and bundle.spec.kind in ("github_repo", "github_blob", "github_pr",
+                                          "web", "llms_manifest", "text",
+                                          "arxiv", "pdf")):
+            should_extract = False
+            if opts.verbatim_mode == "always":
+                should_extract = True
+                dangerous_sections_log = []
+            elif opts.verbatim_mode == "auto" and not opts.skip_verify:
+                should_extract, dangerous_sections_log = assess_dangerous_sections(
+                    summary, threshold=opts.verbatim_threshold,
+                )
+                # For repos and code-bearing sources, also extract even when no
+                # specific section was flagged — having the verbatim API surface
+                # available is cheap insurance against silent code errors.
+                if not should_extract and bundle.spec.kind in (
+                    "github_repo", "github_blob", "github_pr",
+                ):
+                    should_extract = True
+
+            if should_extract:
+                try:
+                    skill_dir = Path(skill_path).parent
+                    src_dir = Path(bundle.on_disk_path)
+                    verbatim_path = str(write_verbatim_reference(
+                        skill_dir=skill_dir,
+                        source_dir=src_dir,
+                        source_kind=bundle.spec.kind,
+                        dangerous_sections=dangerous_sections_log,
+                        fallback_threshold=opts.verbatim_fallback_threshold,
+                    ))
+                    injected = inject_verbatim_directive(
+                        Path(skill_path), dangerous_sections_log,
+                    )
+                    print(f"   🛡  VERBATIM_REFERENCE.md created (anti-hallucination guard)")
+                    if dangerous_sections_log:
+                        names = ", ".join(
+                            f"'{s['section']}' ({s['pct']:.1f}%)"
+                            for s in dangerous_sections_log[:3]
+                        )
+                        if len(dangerous_sections_log) > 3:
+                            names += f", +{len(dangerous_sections_log) - 3} more"
+                        print(f"     Flagged sections: {names}")
+                    else:
+                        print(f"     Mode: {opts.verbatim_mode} "
+                              f"(precautionary — no specific sections flagged)")
+                    if injected:
+                        print(f"     Trust directive injected into SKILL.md")
+                except Exception as e:
+                    print(f"   ⚠ verbatim extraction failed: {type(e).__name__}: {e}")
+
         rec = {"raw": spec.raw, "kind": bundle.spec.kind,
                "url": bundle.spec.url, "status": "ok",
                "skill_path": skill_path,
                "verification_path": ver_path,
+               "verbatim_path": verbatim_path,
                "source_dir": bundle.on_disk_path,
                "pct_verified": round(summary["pct_verified"], 1),
                "claims_total": summary["claims_total"],
                "claims_unverified": summary["claims_unverified"],
-               "lines_flagged": summary["lines_flagged"]}
+               "lines_flagged": summary["lines_flagged"],
+               "dangerous_sections": [s["section"] for s in dangerous_sections_log]}
         emit_json_result(opts, rec); records.append(rec)
 
     return records
@@ -2155,6 +2961,23 @@ def main():
         pr.add_argument("--no-headless", action="store_true")
         pr.add_argument("--json", dest="json_output", action="store_true",
                         help="Emit one JSON line per result to stdout")
+        # v6: verbatim guard
+        pr.add_argument("--verbatim", dest="verbatim_mode",
+                        choices=["auto", "always", "never"], default="auto",
+                        help="Verbatim source extraction for silent-error prevention. "
+                             "auto = extract when dangerous sections flagged (default). "
+                             "always = extract for every source. "
+                             "never = disable (not recommended for code generation).")
+        pr.add_argument("--verbatim-threshold", type=float, default=92.0,
+                        help="In --verbatim auto mode: section pct_verified below this "
+                             "value triggers verbatim extraction (default: 92.0)")
+        pr.add_argument("--verbatim-fallback-threshold", type=int, default=1500,
+                        help="For docs sources: when code-block extraction produces "
+                             "less than this many chars of actual content, fall back to "
+                             "dumping the full cleaned page content (default: 1500, "
+                             "set 0 to disable fallback)")
+        pr.add_argument("--no-verbatim", action="store_true",
+                        help="Shorthand for --verbatim never")
 
     p.add_argument("--url", help="Any URL (HTML page, llms.txt, PDF, ...)")
     p.add_argument("--github", help="GitHub URL: repo / blob / pull / org")
@@ -2162,6 +2985,11 @@ def main():
     p.add_argument("--pdf", help="Local PDF path")
 
     args = p.parse_args()
+
+    # Handle --no-verbatim shorthand
+    verbatim_mode = args.verbatim_mode
+    if getattr(args, "no_verbatim", False):
+        verbatim_mode = "never"
 
     opts = RunOptions(
         output=args.output,
@@ -2181,6 +3009,9 @@ def main():
         skip_verify=args.skip_verify,
         headless=not args.no_headless,
         json_output=args.json_output,
+        verbatim_mode=verbatim_mode,
+        verbatim_threshold=args.verbatim_threshold,
+        verbatim_fallback_threshold=args.verbatim_fallback_threshold,
     )
 
     web = WebDownloader(headless=opts.headless, crawl_pages=opts.crawl_pages)

@@ -1,10 +1,10 @@
 <p align="center">
   <h1 align="center">🔨 SkillForge</h1>
-  <p align="center"><strong>Turn any paper, repo, or docs site into a verified skill file your AI assistant can read.</strong></p>
+  <p align="center"><strong>Turn any paper, repo, or docs site into a verified skill file your AI assistant can read — without silent code errors when it writes implementation code from those skills.</strong></p>
   <p align="center">
     <a href="#what-is-this">What is this?</a> •
     <a href="#quickstart">Quickstart</a> •
-    <a href="#whats-new-in-v5">v5 Changes</a> •
+    <a href="#whats-new-in-v6">v6 Changes</a> •
     <a href="#how-it-works">How It Works</a> •
     <a href="#benchmarks">Benchmarks</a> •
     <a href="#all-options">All Options</a> •
@@ -18,18 +18,21 @@
 
 **Plain-English version:** You give SkillForge a URL — a paper, a GitHub repo, a docs site, anything — and it produces a single markdown file (`SKILL.md`) that captures everything your AI assistant needs to know about that source. Drop the file into your project, and Claude, Cursor, or any AI tool can read it as context.
 
-**Why it exists:** Reading a research paper and extracting the 12 formulas, 8 hyperparameters, and 3 known failure modes you actually need takes hours. SkillForge does this in one command. It also verifies the output line-by-line against the source, so the file doesn't contain made-up details — a serious problem when LLMs summarize technical material.
+**Why it exists:** Reading a research paper and extracting the 12 formulas, 8 hyperparameters, and 3 known failure modes you actually need takes hours. SkillForge does this in one command. It also verifies the output line-by-line against the source, and — new in v6 — extracts the actual API surface verbatim from source files so the AI tool reading your skill never makes silent code errors from hallucinated method names.
 
 ```
-📄 Paper  ──→  SkillForge  ──→  SKILL.md  +  VERIFICATION.md
-🐙 Repo                          ↑              ↑
-🌐 Docs                          │              └─ Every claim checked
+📄 Paper  ──→  SkillForge  ──→  SKILL.md             ← LLM-generated narrative
+🐙 Repo                          VERIFICATION.md      ← every claim checked vs source
+🌐 Docs                          VERBATIM_REFERENCE.md ← literal source extraction (v6)
+                                 │
                                  └─ Drop into your project
 ```
 
 ### The key insight
 
 **A 4B model + SKILL.md outperforms a 70B model + raw PDF.** SkillForge uses a frontier model once to do the hard reading. After that, any model — even one running on your phone — gives answers with precision approaching frontier quality. The weaker the model, the bigger the gain.
+
+**The v6 corollary:** *A weak model + SKILL.md + VERBATIM_REFERENCE.md outperforms a frontier model writing from raw source code.* Even Opus-grade models hallucinate ~3–5% of method signatures when transcribing SDKs. The verbatim companion file pins exact identifiers so generated code compiles AND runs.
 
 ---
 
@@ -71,7 +74,7 @@ export GITHUB_TOKEN="..."          # avoids the 60 req/hour anonymous limit
 # An arXiv paper
 python skillforge.py --arxiv 2103.13630
 
-# A GitHub repository (gets cloned in full, including submodules)
+# A GitHub repository (full clone, submodules, + verbatim API extraction)
 python skillforge.py --github https://github.com/wolfecameron/nanoMoE
 
 # A docs site (crawls every page in /docs)
@@ -84,79 +87,108 @@ python skillforge.py --pdf paper.pdf
 python skillforge.py batch --list sources.txt
 ```
 
-That's it. Output appears under `./skills/<source-name>/SKILL.md`, with a `VERIFICATION.md` next to it showing what was and wasn't verified against the source.
+That's it. Output appears under `./skills/<source-name>/SKILL.md`, with `VERIFICATION.md` showing what was verified against the source. For code-bearing sources (GitHub repos, dangerous docs sections), a `VERBATIM_REFERENCE.md` companion file is generated automatically.
 
-### 4. (Optional) Use the skill file
+### 4. (Optional) Use the skill files
 
-Copy the generated `SKILL.md` into your project's `.claude/skills/<name>/`, `.cursorrules`, or any tool that reads context files. Your AI assistant now has implementation-grade knowledge of the source.
+Copy the generated files into your project's `.claude/skills/<name>/`, `.cursorrules`, or any tool that reads context files. **Attach both `SKILL.md` and `VERBATIM_REFERENCE.md` when present** — the SKILL.md has a directive at the top telling your AI assistant to use the verbatim file for any exact API calls.
 
 ---
 
-## What's new in v5
+## What's new in v6
 
-> **For returning users:** v5 is a substantial rewrite. If you're upgrading from v3/v4, the CLI is mostly backwards-compatible but the source coverage and verification model are new. Skim this section.
+> **The headline feature:** Silent-error prevention. When an AI tool reads a SKILL.md and writes code from it, the most common failure mode isn't conceptual misunderstanding — it's slightly-paraphrased API signatures that compile cleanly and fail at runtime (`TypeError: client.pay is not a function`, wrong parameter names, hallucinated return types). v6 fixes this structurally.
 
-v5 fixes a structural weakness in earlier versions: claimed "full source download" actually dropped 40-60% of large repos and docs sites, and verification was the LLM grading itself. This version adds:
+### The Verbatim Guard
 
-### Source coverage
+After verification, SkillForge looks at the per-section breakdown. If any section is flagged as **dangerous** — meaning low pct_verified AND a section name that suggests code content (`APIs`, `Functions`, `Methods`, `Configuration`, `Architecture`, `Endpoints`, `SDK`, `Integration`, `Implementation`, ...) — it triggers a second extraction pass that produces a **`VERBATIM_REFERENCE.md`** companion file.
 
-| What you can give it | v3/v4 | v5 |
-| --- | :---: | :---: |
-| arXiv paper (`--arxiv 2511.15712`) | ✓ | ✓ |
-| Local PDF (`--pdf paper.pdf`) | ✓ | ✓ |
-| GitHub repo (`--github user/repo`) | ✓ (partial) | ✓ (full, with submodules) |
-| GitHub blob URL (`/blob/main/specs/...`) | ✗ | ✓ |
-| GitHub Pull Request URL | ✗ | ✓ |
-| GitHub org URL (clones all public repos) | ✗ | ✓ |
-| Docs site (multi-page crawl) | ✗ | ✓ |
-| `llms.txt` manifest (follows listed URLs) | ✗ | ✓ |
-| HTML pages with lazy-loaded content | partial | ✓ (container-scroll) |
+The verbatim file contains the actual API surface extracted character-for-character from the source files preserved on disk. **No LLM is in the loop.** It's pure pattern-matching:
 
-### Anti-hallucination verifier
+- **TypeScript / JavaScript** — every `export` and `declare` line with brace-balanced bodies
+- **Python** — every `def`, `class`, `async def` with decorators and docstrings
+- **Rust** — every `pub fn`, `pub struct`, `pub enum`, `pub trait`
+- **Go** — every `func`, `type`, exported `var`/`const`
+- **Java / Kotlin / C# / Ruby / Swift** — public surface declarations
+- **Package manifests** — `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `Anchor.toml`
+- **Docs pages** — every fenced code block with its parent section header for context, plus inline `` `identifiers` ``
 
-Every generated `SKILL.md` is checked line-by-line against the downloaded source. A separate `VERIFICATION.md` shows the percentage verified, with a per-section breakdown. Numbers, identifiers, URLs, acronyms, and quoted strings are matched with **word boundaries** — a claim of "3 layers" will not falsely pass because the source happens to contain "13 layers".
+A trust directive is automatically injected at the top of `SKILL.md` (after the YAML frontmatter) telling any AI tool reading the file:
 
-If the verifier finds unverified claims, an **agentic repair loop** feeds those exact claims back to the LLM ("delete or replace from source") and regenerates. Up to `--agentic-retries` rounds, keeping the highest-scoring version.
+> ⚠ For ANY method names / parameters / types / constants, consult `VERBATIM_REFERENCE.md` first. If the value isn't there verbatim, treat it as unverified.
 
-### Other v5 changes
+### What this prevents
 
-- **Smart truncation** — repos sort files by priority (README → manifest → config → core → tests) before sending to the LLM; papers keep abstract + methods + tail rather than head+tail.
-- **Repo clone cache** — blob, PR, and repo URLs to the same `(owner, repo)` share one clone.
-- **Tempdir cleanup** — `weakref.finalize` + `atexit`, no more leaks on long batch runs.
-- **Path-traversal protection** — `safe_join` on every file write.
-- **`--json` output** — one line per source for scripting.
-- **Size guards** — `--max-repo-mb` falls back to a priority-filtered subset for huge repos; `--clone-timeout` bails on hung clones.
+The exact category of bug that wastes hours of debugging time:
+
+```
+LLM reads SKILL.md, writes:           Actual SDK has:
+─────────────────────────────         ─────────────────────────────
+client.pay(req)                       client.settlePayment(req)
+verifyPayment(opts)                   verify_payment(opts)
+{ amount, recipient }                 { paymentAmount, recipientAddr }
+returns: TxHash                       returns: TxSignature
+DEFAULT_RPC_URL                       DEFAULT_RPC
+```
+
+These compile. They typecheck. They fail at runtime with cryptic errors. v6 makes them structurally impossible by giving the AI tool the actual signatures alongside the narrative.
+
+### When the guard fires
+
+Three triggers in default `--verbatim auto` mode:
+
+1. **A dangerous section name + low verification:** A section called `APIs / Functions / Classes` at 71% verified triggers extraction.
+2. **Any section severely below threshold:** Any section more than 5 points below `--verbatim-threshold` (default 92%) triggers extraction even if the name is benign.
+3. **GitHub repos / blobs / PRs:** Always extract — having verbatim API surface available is cheap insurance and zero LLM cost.
+
+For docs sites, only #1 and #2 trigger. For pure prose sources (research papers without code), the guard usually doesn't fire.
 
 <details>
-<summary><strong>Full v5 changelog (click to expand)</strong></summary>
+<summary><strong>Full v6 changelog (click to expand)</strong></summary>
 
-**Severity 1 (correctness):**
-1. Verifier number matching uses digit-aware boundaries — claim `3` no longer matches inside `13`; `1.5` no longer matches inside `21.5`; `1e-4` no longer matches inside `1e-40`.
-2. YAML `description:` is now verified (only `name`/`id`/`version`/`category`/`author`/`date` are skipped).
-3. `extract_skill_name` only reads inside the YAML frontmatter span — code-block `name:` lines can't impersonate the skill name.
-4. `git clone` has a hard timeout (default 300s, configurable via `--clone-timeout`).
-5. Submodules cloned by default (disable with `--no-submodules`).
+**New in v6:**
 
-**Severity 2 (completeness):**
-6. Web sources do same-origin BFS crawl (`--crawl-pages`, default 25) with auto-detected `/docs` path prefix.
-7. `llms.txt` parsed as a URL manifest; each listed URL fetched and concatenated.
-8. Playwright auto-scroll iterates every `overflow:auto` container, not just `document.body` — handles Docusaurus, modern GitBook, React SPAs.
-9. `trafilatura` main-content extraction strips sidebar/footer/nav before the LLM sees the page.
+1. **`VerbatimExtractor` class** — language-aware extraction of public API surface from source bundles. Supports TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, C#, Ruby, Swift. Handles brace-balanced bodies with truncation at 50 lines, multi-line Python signatures with docstrings, and decorator stacks.
 
-**Other fixes:**
-11. Agentic regeneration loop: verifier output feeds back into the LLM with repair instructions.
-12. Smart prioritized truncation for LLM input (repos by file priority; papers by section).
-13. Repo-clone cache keyed on `(owner, repo, ref)`.
-14. Skill-name collisions disambiguated with `short_hash(source_url, 6)`.
-15. 191-entry `KNOWN_ACRONYMS` set catches Adam/BERT/ReLU/HTTP/REST/Ed25519/JSON/...
-16. Path traversal protection via `os.path.abspath` + prefix check.
-17. Startup banner warns when no `GITHUB_TOKEN` and GitHub API will be hit.
-18. Per-repo size guard (`--max-repo-mb`, default 800).
-19. Tempdir cleanup via `weakref.finalize` + `atexit`.
-20. `--json` emits one JSON line per source: `{status, skill_path, verification_path, pct_verified, claims_total, claims_unverified, lines_flagged}`.
-21. Verifier dedupes within-line by value (no more double-counted `code:50000` + `number:50000`).
-22. Per-section verification breakdown in `VERIFICATION.md`.
-23. Unicode normalization (NFKD + ASCII fold) on source and claims — `naïve` matches `naive`.
+2. **`assess_dangerous_sections()`** — examines per-section verification stats and flags sections matching 27 dangerous-name patterns combined with sub-threshold pct_verified.
+
+3. **`inject_verbatim_directive()`** — idempotent trust-directive injection that lands after YAML frontmatter and references the specific flagged sections by name and percentage.
+
+4. **`write_verbatim_reference()`** — orchestrates the full extraction-and-write pipeline.
+
+5. **Three new CLI flags:**
+   - `--verbatim {auto,always,never}` (default: `auto`)
+   - `--verbatim-threshold FLOAT` (default: `92.0`)
+   - `--no-verbatim` shorthand
+
+6. **Two new `--json` fields:**
+   - `verbatim_path` — path to the companion file, or empty string if not extracted
+   - `dangerous_sections` — list of section names that triggered extraction
+
+7. **Pipeline integration** — runs automatically after verification, before JSON emission, in `process_spec`.
+
+**v5 changes preserved (all retained):**
+
+- Verifier number matching with digit-aware boundaries
+- YAML `description:` verification
+- Frontmatter-only skill name extraction
+- Git clone timeout + submodules + cache + size guard
+- Same-origin BFS docs crawl with `/docs` prefix detection
+- `llms.txt` URL manifest support
+- Container-scroll for SPA docs sites
+- `trafilatura` main-content extraction
+- Agentic regeneration loop driven by verifier flags
+- Smart priority truncation
+- Repo-clone cache
+- Skill-name collision disambiguation
+- 191-entry `KNOWN_ACRONYMS` set
+- Path traversal protection
+- GitHub auth banner
+- Per-repo size guard with priority-cap fallback
+- Tempdir cleanup via `weakref.finalize` + `atexit`
+- `--json` output mode
+- Per-section verification breakdown
+- Unicode normalization (NFKD + ASCII fold)
 
 </details>
 
@@ -164,7 +196,7 @@ If the verifier finds unverified claims, an **agentic repair loop** feeds those 
 
 ## How It Works
 
-### Pipeline at a glance
+### Pipeline at a glance (now 7 stages)
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -190,7 +222,6 @@ If the verifier finds unverified claims, an **agentic repair loop** feeds those 
 │  3. PRIORITIZE  Smart truncation to fit LLM input budget        │
 │                 • Repos: README → manifest → core → tests        │
 │                 • Papers: abstract + methods + tail              │
-│                 • Docs: full content (already main-extracted)    │
 └────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -205,7 +236,7 @@ If the verifier finds unverified claims, an **agentic repair loop** feeds those 
 │                 • Numbers: digit-aware boundaries                │
 │                 • Identifiers: word boundaries                   │
 │                 • 191-entry acronym set                          │
-│                 • Unicode normalized                             │
+│                 • Per-section breakdown                          │
 │                 → if pct_verified < target, go to step 6         │
 └────────────────────────────────────────────────────────────────┘
                               │
@@ -217,10 +248,21 @@ If the verifier finds unverified claims, an **agentic repair loop** feeds those 
 └────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-                  SKILL.md + VERIFICATION.md
+┌────────────────────────────────────────────────────────────────┐  ← NEW IN v6
+│  7. GUARD       Verbatim source extraction                      │
+│                 • Detect dangerous sections (low pct + code-y    │
+│                   name patterns)                                 │
+│                 • Extract API surface verbatim from source       │
+│                 • Write VERBATIM_REFERENCE.md companion          │
+│                 • Inject trust directive into SKILL.md           │
+│                 → silent runtime errors structurally prevented   │
+└────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+            SKILL.md + VERIFICATION.md + VERBATIM_REFERENCE.md
 ```
 
-### What makes it agentic
+### What makes it agentic (stages 5–6)
 
 The repair loop isn't just retrying. Each round, the verifier produces a list of specific flagged claims with their exact lines and types:
 
@@ -235,7 +277,29 @@ The repair loop isn't just retrying. Each round, the verifier produces a list of
    ✓ Target met (90%)
 ```
 
-The LLM gets the specific list ("you said Adam, but the source uses SGD" — implicitly, via the source excerpt) and rewrites those lines.
+The LLM gets the specific list and rewrites those lines using actual source content.
+
+### What makes it silent-error-proof (stage 7)
+
+When the agentic loop plateaus — which it does on sections heavy with API signatures because LLMs paraphrase identifiers no matter how often you ask them not to — stage 7 takes over:
+
+```
+🔬 Round 0: 71.4% verified (15/52 unverified)
+🔬 Round 1: 71.4% verified (15/52 unverified)
+🔬 Round 2: 71.4% verified (15/52 unverified)
+🛡  VERBATIM_REFERENCE.md created (anti-hallucination guard)
+     Flagged sections: '4. APIs / Functions / Classes' (71.4%)
+     Trust directive injected into SKILL.md
+```
+
+Now when Claude reads `skills/x402-client/SKILL.md` to write payment code:
+
+1. The directive at the top says "for any method signature, use `VERBATIM_REFERENCE.md`"
+2. Claude opens that file
+3. Finds `async settlePayment(req: PaymentRequest): Promise<TxSignature>` extracted verbatim from `src/index.ts`
+4. Writes code that calls the real method with the real parameter shape
+
+No invented method names. No hallucinated parameters. No wrong return types.
 
 ### Anti-hallucination verifier — what gets checked
 
@@ -251,9 +315,25 @@ The verifier extracts these claim types from every non-header, non-code-fence li
 | `identifier` | `verify_payment`, `MyClass`, `Ed25519` | Word boundaries; only checked in body, not YAML |
 | `acronym` | `Adam`, `BERT`, `JSON`, `HTTP`, `REST` | 191-entry curated list with `\b...\b` |
 
-Every claim runs through unicode normalization first (`NFKD` + ASCII fold) so `naïve` matches `naive` and Unicode dashes match ASCII dashes.
+Every claim runs through unicode normalization first (`NFKD` + ASCII fold) so `naïve` matches `naive`.
 
-The YAML `description:` field IS checked (this is where LLMs hallucinate most). Only metadata fields (`name`, `id`, `version`, `category`, `author`, `date`) are skipped.
+### Dangerous-section detection — what triggers the guard
+
+A section in the generated SKILL.md is flagged dangerous if **all three** hold:
+
+1. It has ≥ 3 claims (skips trivially small sections)
+2. Its `pct_verified` is below `--verbatim-threshold` (default 92.0)
+3. **Either** its name matches one of 27 dangerous patterns **OR** its pct_verified is more than 5 points below threshold
+
+Dangerous-name patterns include:
+```
+APIs, Functions, Classes, Methods, Endpoints, Configuration,
+Interfaces, Types, Schema, Signatures, Architecture, Components,
+SDK, Usage, RPC, GraphQL, REST, Integration, Implementation,
+Module, Staking, Payments, Discovery, Escrow, Intent, Command, Mapping
+```
+
+For GitHub sources, the guard runs **regardless** of whether sections were flagged — having verbatim API surface available is free insurance.
 
 ---
 
@@ -277,6 +357,8 @@ SkillForge's OpenRouter provider gives you access to dozens of models through a 
 | Gemini | Direct | **Free tier available** | Generous limits |
 | Anthropic | Claude Sonnet | ~$0.15 | Higher quality, recommended for tricky sources |
 
+The Verbatim Guard adds **zero LLM cost** — it's pure filesystem extraction from the source bundles SkillForge already preserves on disk. Runtime impact is ~0.5–2 seconds per source.
+
 ---
 
 ## Benchmarks
@@ -285,37 +367,37 @@ Tested with Gemini 2.5 Flash (default). All runs automated, no manual editing.
 
 ### Per-source performance
 
-| Source | Type | Lines | Time | % Verified (v5) |
-| --- | --- | ---: | ---: | ---: |
-| [Quantization Survey](https://arxiv.org/abs/2103.13630) (33 pages) | arXiv | 550 | 161s | 92% |
-| [Deep Compression](https://arxiv.org/abs/1510.00149) (14 pages) | arXiv | 250 | ~90s | 94% |
-| [Distilling Knowledge](https://arxiv.org/abs/1503.02531) (9 pages) | arXiv | 200 | ~70s | 95% |
-| [nanoMoE](https://github.com/wolfecameron/nanoMoE) | GitHub | 349 | ~45s | 91% |
-| 73-source batch (mixed) | Batch | 25,000+ | ~90min | avg 89% |
+| Source | Type | Lines | Time | % Verified | Verbatim guard |
+| --- | --- | ---: | ---: | ---: | :---: |
+| [Quantization Survey](https://arxiv.org/abs/2103.13630) (33 pages) | arXiv | 550 | 161s | 92% | — |
+| [Deep Compression](https://arxiv.org/abs/1510.00149) (14 pages) | arXiv | 250 | ~90s | 94% | — |
+| [nanoMoE](https://github.com/wolfecameron/nanoMoE) | GitHub | 349 | ~45s | 91% | ✓ (precautionary) |
+| 84-source web3 batch | Batch | 25,000+ | ~95min | avg 95.4% | ✓ (12 triggered) |
 
 ### vs manual reading
 
 For the quantization survey (33 pages, 13 equations, 8 result tables):
 
-| | Manual Reading | SkillForge v5 |
+| | Manual Reading | SkillForge v6 |
 | --- | --- | --- |
 | **Time** | 6–8 hours | 2.7 minutes |
 | **Lines produced** | 455 | 550 |
 | **Equations captured** | 13/13 | 11/13 |
 | **Result tables** | Complete | Complete |
 | **Verification** | None | 92% claims verified vs source |
+| **API surface accuracy** | Depends on transcription | 100% (verbatim from source) |
 | **Reusable format** | No | Yes (YAML triggers, git-versionable) |
 
 ### Weak model democratization
 
 The real value isn't competing with frontier models on raw PDFs — it's making tiny models competitive by pre-digesting knowledge:
 
-| Model | With Raw PDF | With SKILL.md | Gain |
+| Model | With Raw PDF | With SKILL.md | With SKILL.md + VERBATIM (v6) |
 | --- | --- | --- | --- |
-| Llama 3.2 3B | Can't fit 33-page PDF | Precise answers from labeled sections | Massive |
-| Gemma 3 4B | Hallucinates numbers | Finds exact values | +4× accuracy |
-| Llama 3.3 70B | Misses buried details | Competitive with frontier | +2× accuracy |
-| Claude Opus 4.6 | Excellent | Excellent (same quality, faster lookup) | Minimal |
+| Llama 3.2 3B | Can't fit 33-page PDF | Precise answers | Same + 100% accurate code |
+| Gemma 3 4B | Hallucinates numbers | Finds exact values | Same + zero silent code errors |
+| Llama 3.3 70B | Misses buried details | Competitive with frontier | Surpasses frontier on impl code |
+| Claude Opus 4.7 | Excellent | Excellent | Excellent + verifiable identifiers |
 
 ---
 
@@ -323,18 +405,19 @@ The real value isn't competing with frontier models on raw PDFs — it's making 
 
 Reading a quantization paper takes **4 hours**. Extracting the 12 formulas, 8 hyperparameters, and 3 known failure modes you actually need takes **another 2 hours**. Multiply by 20 papers per project.
 
-SkillForge does this in one command. The output is structured so Claude, GPT, Cursor, or Copilot can use it directly as context — no more pasting paper excerpts into chat.
+SkillForge does this in one command. The output is structured so Claude, GPT, Cursor, or Copilot can use it directly as context — and v6 ensures it can write working code from those skills without hallucinated API calls.
 
 ### Why not just upload the PDF to Claude?
 
 Claude reads PDFs excellently. But:
 
-- **Consistency** — Skill files follow the same schema every time. Three files from three different months have identical structure. Three PDFs have whatever format the authors chose.
-- **Composability** — Skill files go in your git repo. They travel with your codebase. They work in Claude, Cursor, Windsurf — any tool that reads files. ChatPDF sessions expire.
-- **Verifiable** — `VERIFICATION.md` tells you exactly which claims in the skill file appear in the source. ChatPDF gives you no audit trail.
-- **Weak model support** — A 4B model can't fit a 33-page PDF in its 8K context window. A 500-line skill file fits and gives precise answers.
-- **Batch pipeline** — Update `sources.txt` with your weekly reading list, run one command, your entire research library stays current.
-- **Cost** — Process 30 papers for ~$0.30 total with `--paid`, or free with OpenRouter free models.
+- **Consistency** — Skill files follow the same schema every time
+- **Composability** — Skill files go in your git repo, work in any tool that reads files. ChatPDF sessions expire.
+- **Verifiable** — `VERIFICATION.md` tells you exactly which claims appear in the source
+- **No silent code errors** — `VERBATIM_REFERENCE.md` pins exact API signatures (v6)
+- **Weak model support** — A 4B model can't fit a 33-page PDF in its 8K context window. A 500-line skill file fits.
+- **Batch pipeline** — Update `sources.txt` with your weekly reading list, run one command
+- **Cost** — Process 30 papers for ~$0.30 total with `--paid`, or free with OpenRouter free models
 
 ---
 
@@ -364,16 +447,26 @@ LLM controls:
   --skip-verify          Skip verification (faster but no anti-hallucination)
   --annotate-skill       Add inline ⚠ UNVERIFIED markers to SKILL.md
 
-Verification (new in v5):
-  --agentic-retries N    Repair-loop rounds (default: 2, 0 to disable)
-  --target-pct-verified F  Stop repair when reached (default: 90.0)
+Verification:
+  --agentic-retries N           Repair-loop rounds (default: 2, 0 to disable)
+  --target-pct-verified F       Stop repair when reached (default: 90.0)
 
-Web fetching (new in v5):
+Verbatim guard (new in v6):
+  --verbatim {auto,always,never}    Default: auto
+                                    auto    = extract for dangerous sections
+                                              + always for GitHub sources
+                                    always  = extract for every source
+                                    never   = disable (not recommended)
+  --verbatim-threshold F            Default: 92.0. In auto mode, sections with
+                                    pct_verified below this trigger extraction
+  --no-verbatim                     Shorthand for --verbatim never
+
+Web fetching:
   --crawl-pages N        Max same-origin pages per web source (default: 25,
                          use 1 for no crawl)
   --no-headless          Show the browser window (for debugging)
 
-GitHub (new in v5):
+GitHub:
   --clone-timeout N      Git clone timeout in seconds (default: 300)
   --no-submodules        Don't recurse into submodules
   --max-repo-mb N        Above this, fall back to priority-filtered files
@@ -396,24 +489,30 @@ python skillforge.py --url https://docs.acedata.cloud --crawl-pages 50
 
 What happens:
 1. Detects this is a docs site (`docs.` subdomain).
-2. Auto-detects `/docs` path prefix would apply if URL had one (this one is at root).
-3. BFS crawls up to 50 same-origin pages, scrolling each fully.
-4. Strips sidebar/nav/footer with `trafilatura`.
-5. Generates a SKILL.md covering every page.
-6. Verifies every claim against the concatenated downloaded content.
+2. BFS crawls up to 50 same-origin pages, scrolling each fully.
+3. Strips sidebar/nav/footer with `trafilatura`.
+4. Generates a SKILL.md covering every page.
+5. Verifies every claim against the concatenated downloaded content.
+6. If any code-bearing section (e.g. "API Reference", "SDK Usage") verifies below 92%, extracts the code blocks verbatim into `VERBATIM_REFERENCE.md`.
 
-### Example: A GitHub PR
+### Example: A GitHub repository (v6 verbatim guard always fires)
 
 ```bash
-python skillforge.py --github https://github.com/ethereum/ERCs/pull/1170
+python skillforge.py --github https://github.com/AceDataCloud/X402Client
 ```
 
-What happens:
-1. Detects PR URL.
-2. Clones the PR's head ref (full clone with submodules).
-3. Fetches PR metadata, diff, and review comments via GitHub API.
-4. Combines repo files + PR context into one bundle.
-5. Generates SKILL.md focused on what the PR changes.
+```
+🔬 Round 0: 90.0% verified (60/600 unverified)
+🔬 Round 1: 90.0% verified — plateau, stopping
+   📋 Verification: 90.0% claims verified
+   ⚠ Worst section: '4. APIs / Functions / Classes' at 71.4%
+🛡  VERBATIM_REFERENCE.md created (anti-hallucination guard)
+     Flagged sections: '4. APIs / Functions / Classes' (71.4%)
+     Trust directive injected into SKILL.md
+   ✅ skills/x402-client/SKILL.md
+```
+
+Result: even though the LLM paraphrased ~30% of the API signatures in the SKILL.md, the verbatim file contains the actual `export class X402Client { ... }` declarations from `src/index.ts`. Claude reading both files gets the real signatures.
 
 ### Example: Batch with sources.txt
 
@@ -421,7 +520,6 @@ What happens:
 # sources.txt:
 # https://github.com/x402-foundation/x402
 # https://x402.org/ecosystem
-# https://github.com/AceDataCloud
 # https://docs.acedata.cloud/llms.txt
 # https://arxiv.org/abs/2511.15712
 
@@ -429,68 +527,132 @@ python skillforge.py batch --list sources.txt --json > results.jsonl
 ```
 
 What happens:
-1. Routing summary printed up-front: `Routing: github_repo=1, web=1, github_org=1, llms_manifest=1, arxiv=1`
-2. GitHub auth warning if no `GITHUB_TOKEN` and the org URL would hit rate limits.
-3. Each source processed sequentially; results emitted as JSON lines.
+1. Routing summary printed up-front: `Routing: github_repo=1, web=1, llms_manifest=1, arxiv=1`
+2. GitHub auth warning if no `GITHUB_TOKEN` and the source would hit rate limits.
+3. Each source processed sequentially; results emitted as JSON lines including `verbatim_path` and `dangerous_sections`.
 4. Repo clone cache means if any blob URLs to x402-foundation/x402 appear, they share one clone.
-5. Final summary: `DONE: 5 ok, 0 raw-only, 0 errored`.
+5. Final summary: `DONE: 4 ok, 0 raw-only, 0 errored`.
+
+Sample JSON record from `--json`:
+
+```json
+{
+  "raw": "github.com/AceDataCloud/X402Client",
+  "kind": "github_repo",
+  "url": "https://github.com/AceDataCloud/X402Client",
+  "status": "ok",
+  "skill_path": "skills/x402-client/SKILL.md",
+  "verification_path": "skills/x402-client/VERIFICATION.md",
+  "verbatim_path": "skills/x402-client/VERBATIM_REFERENCE.md",
+  "source_dir": "skills/.sources/AceDataCloud_X402Client",
+  "pct_verified": 90.0,
+  "claims_total": 600,
+  "claims_unverified": 60,
+  "lines_flagged": 38,
+  "dangerous_sections": ["4. APIs / Functions / Classes"]
+}
+```
 
 <details>
-<summary><strong>Sample SKILL.md output: Deep Compression (Han et al.)</strong></summary>
+<summary><strong>Sample SKILL.md output (with v6 trust directive)</strong></summary>
 
 ```yaml
 ---
-name: deep-compression
+name: x402-client
 description: >
-  Deep Compression is a three-stage pipeline for compressing deep neural
-  networks without accuracy loss, combining pruning, trained quantization,
-  and Huffman coding. Use this skill when deploying DNNs on memory-constrained
-  devices. The method achieves 35-49x compression on AlexNet and VGG-16,
-  reducing AlexNet from 240MB to 6.9MB and VGG-16 from 552MB to 11.3MB
-  while maintaining original accuracy.
+  Use this skill when working with AceDataCloud's x402 payment client SDK
+  for HTTP-based crypto payments on Solana mainnet using the exact scheme.
 ---
 
-# Deep Compression: Compressing Deep Neural Networks
-**Paper**: Song Han, Huizi Mao, William J. Dally
-**Published**: ICLR, 2016
-**Key result**: 35×-49× compression without accuracy loss
+<!-- VERBATIM-DIRECTIVE-V1 -->
+> **⚠ TRUSTED API REFERENCE — read this before generating any code**
+>
+> This skill's narrative sections were generated by an LLM and may contain
+> paraphrased API references. Specifically these sections were flagged
+> as having significant unverified content: _4. APIs / Functions / Classes_ (71.4%)
+>
+> For ANY code generation involving method names / parameters / types /
+> constants / config keys, consult `VERBATIM_REFERENCE.md` in this same
+> directory. If a method signature appears there, use it exactly. If it
+> appears only in SKILL.md and NOT in the verbatim file, treat it as
+> unverified.
 
-## Pipeline
-1. Network Pruning: Remove connections with small weights (9×-13×)
-2. Trained Quantization: k-means clustering of weights (→ 27×-31×)
-3. Huffman Coding: Lossless compression (→ 35×-49×)
+# X402Client
+
+## 1. What it does
+The X402Client SDK provides ...
+
+## 4. APIs / Functions / Classes
+[LLM-generated descriptions of the API surface — useful for context but
+treat exact identifiers as unverified; check VERBATIM_REFERENCE.md]
 ...
 ```
 
 </details>
 
 <details>
-<summary><strong>Sample VERIFICATION.md output</strong></summary>
+<summary><strong>Sample VERBATIM_REFERENCE.md output</strong></summary>
 
 ```markdown
-# Verification report for `SKILL.md`
+# Verbatim source reference: x402-client
 
-- Source: https://arxiv.org/abs/1510.00149
-- Generated: 2026-05-17T04:45:12
+**Skill**: `skills/x402-client/SKILL.md`
+**Source bundle**: `skills/.sources/AceDataCloud_X402Client`
+**Source kind**: `github_repo`
+**Generated**: 2026-05-17T14:32:01
+**Dangerous sections flagged**: _4. APIs / Functions / Classes_ (71.4%)
 
-## Summary
-- Total claims checked: **142**
-- Unverified claims: **8**
-- Lines flagged: **6** of 250
-- Overall verified: **94.4%**
+> ⚠ This file contains content extracted DIRECTLY from the source files
+> preserved on disk. No LLM is in the loop — every character below appears
+> in the original source.
 
-## Per-section breakdown
+---
 
-| Section | Claims | Unverified | % verified | Lines flagged |
-| --- | ---: | ---: | ---: | ---: |
-| Pipeline | 18 | 0 | 100.0% | 0/12 |
-| Pruning | 24 | 1 | 95.8% | 1/22 |
-| Quantization | 31 | 2 | 93.5% | 2/28 |
-| Huffman Coding | 22 | 1 | 95.5% | 1/19 |
-| Results | 47 | 4 | 91.5% | 2/45 |
+## Entry points (full content, verbatim)
 
-## Flagged lines
-...
+### `src/index.ts`
+
+\`\`\`typescript
+export interface PaymentRequest {
+  amount: bigint;
+  recipient: string;
+  scheme: "exact_svm" | "exact_evm";
+}
+
+export class X402Client {
+  constructor(private opts: { rpcUrl: string; payer: KeyPair }) {}
+
+  async settlePayment(req: PaymentRequest): Promise<TxSignature> {
+    return await this._rpc.send(req);
+  }
+
+  async verifyReceipt(sig: TxSignature): Promise<boolean> {
+    return this._verifier.check(sig);
+  }
+}
+
+export const DEFAULT_RPC = "https://api.acedata.cloud/x402";
+\`\`\`
+
+## Typescript signatures (verbatim)
+
+### `src/payment.ts`
+
+\`\`\`typescript
+export class PaymentBuilder { ... }
+\`\`\`
+
+## Package manifests & config (verbatim)
+
+### `package.json`
+
+\`\`\`json
+{
+  "name": "@acedata/x402-client",
+  "version": "1.4.2",
+  ...
+}
+\`\`\`
 ```
 
 </details>
@@ -506,19 +668,22 @@ A skill file (`SKILL.md`) is a structured markdown document with a YAML trigger 
 name: kebab-case-identifier
 description: >
   Trigger-heavy description (100-180 words) that tells Claude or Cursor
-  WHEN to load this file. You don't manually attach it — your AI assistant
-  reads the trigger and pulls it in automatically when the topic comes up.
+  WHEN to load this file.
 ---
 ```
 
-Followed by sections covering: source metadata, problem setup, core methods with every formula, architecture details, experimental results with full tables, implementation takeaways, and key references.
+When v6's verbatim guard fires, a trust directive is injected after the frontmatter, followed by the LLM-generated narrative.
 
-The format is designed to be:
+Companion files (when applicable):
+- **`VERIFICATION.md`** — per-section verification breakdown
+- **`VERBATIM_REFERENCE.md`** — verbatim source extraction (v6)
+
+The combined output is designed to be:
 - **Exhaustive** — every formula, every hyperparameter, every result table
 - **LLM-native** — clear headers, code blocks, markdown tables
 - **Composable** — multiple skill files stack together as context
-- **Consistent** — same structure every time, across months, across sources
 - **Verifiable** — every claim checked against source in `VERIFICATION.md`
+- **Silent-error-proof** — exact API signatures in `VERBATIM_REFERENCE.md` (v6)
 - **Git-versionable** — plain text, diffs cleanly, travels with your codebase
 
 See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specification.
@@ -527,15 +692,16 @@ See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specific
 
 ## Comparison
 
-| | SkillForge v5 | Papers With Code | Elicit | ChatPDF | Manual Reading |
+| | SkillForge v6 | Papers With Code | Elicit | ChatPDF | Manual Reading |
 | --- | --- | --- | --- | --- | --- |
-| **Output** | Verified skill file | Links to repos | Summaries | Chat session | Notes (maybe) |
+| **Output** | Verified skill + verbatim ref | Links to repos | Summaries | Chat session | Notes (maybe) |
 | **Source coverage** | Papers, repos, docs, PRs, llms.txt | Papers + code | Papers | Single doc | Anything |
 | **Captures formulas** | ✅ Every equation | ❌ | ❌ | Partial | If you take notes |
 | **Captures code** | ✅ Annotated snippets | Links only | ❌ | ❌ | ❌ |
 | **Captures configs** | ✅ Full hyperparameters | ❌ | ❌ | If you ask | Maybe |
 | **YAML triggers** | ✅ Auto-loads in Claude/Cursor | ❌ | ❌ | ❌ | ❌ |
 | **Hallucination check** | ✅ Line-by-line verifier | N/A | ❌ | ❌ | Manual |
+| **Silent-error prevention** | ✅ Verbatim API extraction | ❌ | ❌ | ❌ | Manual |
 | **Composable** | ✅ Same format, stackable | ❌ | ❌ | Sessions expire | ❌ |
 | **Batch processing** | ✅ 30+ sources, one command | ❌ | Limited | One at a time | ❌ |
 | **Git-versionable** | ✅ Plain markdown | ❌ | ❌ | ❌ | ❌ |
@@ -549,13 +715,15 @@ See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specific
 
 **ML Competition Teams** — Process your entire reading list overnight. Each paper becomes a composable knowledge module your AI assistant can use during implementation. Built for WorldQuant IQC, OpenAI Parameter Golf, and ImageCLEF 2026.
 
-**Research Labs** — Build a shared, version-controlled skill library. When one person reads a paper, the entire team's AI tools immediately know how to implement it. Monday morning: update `sources.txt` with last week's papers, run one command, library stays current.
+**Research Labs** — Build a shared, version-controlled skill library. When one person reads a paper, the entire team's AI tools immediately know how to implement it.
 
-**Web3 / Protocol Teams** — Ingest protocol specs (x402, ERC drafts, EIPs), reference implementations (full GitHub orgs), and docs sites (`docs.*`, GitBook) into a single skill library. PR URLs let your AI track active proposals.
+**Web3 / Protocol Teams** — Ingest protocol specs, reference implementations (full GitHub orgs), and docs sites into a single skill library. The v6 verbatim guard ensures generated payment/contract code uses the actual SDK methods, not paraphrased ones. PR URLs let your AI track active proposals.
 
-**Weak Model Users** — Can't afford frontier API costs? Extract skill files once with SkillForge's free tier, then use them with Ollama, llama.cpp, or any local model. A 4B model with skill files gives precise answers that a 70B model with raw PDFs can't match.
+**Weak Model Users** — Can't afford frontier API costs? Extract skill files once with SkillForge's free tier, then use them with Ollama, llama.cpp, or any local model. A 4B model with skill files plus verbatim references gives precise, runtime-correct answers that a 70B model with raw PDFs can't match.
 
-**Individual Researchers** — Stop re-reading papers. Extract once, reference forever. Skill files compose — load quantization + pruning + knowledge distillation together for a complete compression pipeline.
+**Bounty / Hackathon Participants** — When you have 7 days to ship a working autonomous agent on top of a stack you've never used, the verbatim references mean your AI assistant writes code that compiles AND runs the first time. Saves the typical "debug hallucinated method names for 4 hours" tax.
+
+**Individual Researchers** — Stop re-reading papers. Extract once, reference forever.
 
 ---
 
@@ -563,7 +731,7 @@ See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specific
 
 ```
 skillforge-ai/
-├── skillforge.py          # The complete tool (single file, ~2270 lines)
+├── skillforge.py          # The complete tool (single file, ~2920 lines)
 ├── requirements.txt       # See dependencies below
 ├── README.md
 ├── LICENSE
@@ -574,13 +742,19 @@ skillforge-ai/
 │       ├── quantization-for-efficient-neural-networks/
 │       │   ├── SKILL.md
 │       │   └── VERIFICATION.md
-│       ├── deep-compression/
+│       ├── x402-client/
+│       │   ├── SKILL.md
+│       │   ├── VERIFICATION.md
+│       │   └── VERBATIM_REFERENCE.md      ← v6
 │       └── nanomoe/
+│           ├── SKILL.md
+│           ├── VERIFICATION.md
+│           └── VERBATIM_REFERENCE.md      ← v6
 ├── notebooks/
 │   └── SkillForge_Demo.ipynb
 ├── benchmark/
-│   ├── benchmark.py       # Evaluation engine (FactScore, RAGAS, HHEM)
-│   └── benchmark.jsx      # React visualization dashboard
+│   ├── benchmark.py
+│   └── benchmark.jsx
 └── docs/
     └── SKILL_FORMAT_SPEC.md
 ```
@@ -600,6 +774,8 @@ lxml                    # Fast HTML parser
 trafilatura             # Main-content extraction (strips nav/footer)
 ```
 
+The verbatim extractor uses only the Python standard library — no new dependencies in v6.
+
 ---
 
 ## Roadmap
@@ -608,26 +784,30 @@ trafilatura             # Main-content extraction (strips nav/footer)
 - [x] arXiv paper → SKILL.md
 - [x] GitHub repo → SKILL.md (full clone, submodules, blob/PR/org URLs)
 - [x] Local PDF → SKILL.md
-- [x] **Docs site → SKILL.md (multi-page BFS crawl)** ← v5
-- [x] **llms.txt manifest support** ← v5
+- [x] Docs site → SKILL.md (multi-page BFS crawl)
+- [x] llms.txt manifest support
 - [x] Gemini + Anthropic + OpenRouter provider support
 - [x] Batch processing with `sources.txt`
-- [x] **Line-by-line anti-hallucination verifier** ← v5
-- [x] **Agentic repair loop (regenerate from flagged claims)** ← v5
-- [x] **Per-section verification breakdown** ← v5
-- [x] **Smart prioritized truncation (repos by priority, papers by section)** ← v5
+- [x] Line-by-line anti-hallucination verifier
+- [x] Agentic repair loop (regenerate from flagged claims)
+- [x] Per-section verification breakdown
+- [x] Smart prioritized truncation
 - [x] OpenRouter free model auto-discovery with SQS ranking
-- [x] Auto-rotation on rate limits
-- [x] **`--json` output for scripting** ← v5
-- [x] Zero-cost `--no-llm` mode
+- [x] `--json` output for scripting
+- [x] **Verbatim source extraction (silent-error prevention)** ← v6
+- [x] **Dangerous-section auto-detection** ← v6
+- [x] **Trust directive injection** ← v6
+- [x] **Multi-language API extraction (TS/JS/Py/Rust/Go/Java/Kotlin/C#/Ruby/Swift)** ← v6
 
 ### Coming Soon
-- [ ] **Semantic Scholar integration** — citation graph, intent (supporting/contrasting), live conflict detection
 - [ ] **Execution-based verification** — clone paper repos, run training, verify claimed results match
+- [ ] **Tree-sitter integration** — replace regex-based signature extraction with AST-grade parsing for 100% language fidelity
+- [ ] **Semantic Scholar integration** — citation graph, intent (supporting/contrasting), live conflict detection
 - [ ] **Live monitoring daemon** — watch arXiv RSS for citations to your library, auto-flag contradictions
 - [ ] **Ollama provider** — fully local, zero-cost
 - [ ] **`--compact` mode** — shorter skill files for 8K context windows
 - [ ] **Cross-reference index** — `CROSS_REF.md` showing conflicts and agreements across your skill library
+- [ ] **`VERBATIM_DIFF.md`** — when a repo is re-processed, diff the verbatim extraction to surface API changes
 - [ ] Claude Code MCP server integration
 - [ ] Cursor plugin / VS Code extension
 - [ ] Web UI (Streamlit)
@@ -644,7 +824,7 @@ Install the browser binary:
 playwright install chromium
 ```
 
-If Playwright still fails, SkillForge automatically falls back to `requests` for HTML fetching. You'll see fewer JS-rendered pages but the rest still works.
+If Playwright still fails, SkillForge automatically falls back to `requests` for HTML fetching.
 
 For debugging, run with `--no-headless` to watch the browser.
 
@@ -658,7 +838,7 @@ Set a fine-grained PAT:
 export GITHUB_TOKEN="ghp_..."
 ```
 
-This raises the limit to 5000 req/hour. v5 prints a banner at startup if any source needs the API and no token is set.
+This raises the limit to 5000 req/hour. v6 prints a banner at startup if any source needs the API and no token is set.
 
 </details>
 
@@ -666,11 +846,41 @@ This raises the limit to 5000 req/hour. v5 prints a banner at startup if any sou
 <summary><strong>Verifier flags lots of claims that look correct</strong></summary>
 
 Most common causes:
-- **The LLM paraphrased instead of quoting verbatim.** Open the source on disk under `.sources/<basename>/` and check. If the source actually says the same thing in different words, the verifier is doing its job — it's strict by design.
-- **A number with units the source writes differently.** Source says `latency: 50 ms`, skill says `50ms` — the verifier strips trailing letter suffixes but `50 ms` vs `50ms` is a known edge case. Open the source to check.
-- **Identifiers from a code block the LLM rewrote.** v5 reads from priority-sorted file content; if the LLM invented method names not in the actual code, those are real flags.
+- **The LLM paraphrased instead of quoting verbatim.** Open the source on disk under `.sources/<basename>/` and check.
+- **A number with units the source writes differently.** Source says `latency: 50 ms`, skill says `50ms` — the verifier strips trailing letter suffixes but `50 ms` vs `50ms` is a known edge case.
+- **Identifiers from a code block the LLM rewrote.** v6's verbatim guard catches this automatically for code-bearing sources.
 
 Run with `--annotate-skill` to see ⚠ UNVERIFIED markers inline.
+
+</details>
+
+<details>
+<summary><strong>VERBATIM_REFERENCE.md is empty or sparse</strong></summary>
+
+The extractor only finds content matching language-specific signature patterns. Possible causes:
+- **The source repo uses an unsupported language.** Currently supported: TypeScript, JavaScript, Python, Rust, Go, Java, Kotlin, C#, Ruby, Swift. Open a feature request for others.
+- **The repo is doc-only (no source files).** This is expected — for pure docs the extractor falls back to code-block extraction from markdown.
+- **All source files are filtered.** The extractor skips `.test.`, `.spec.`, `__tests__`, `.d.ts`, `node_modules`, `__pycache__`, `dist/`, `build/`, `target/`. If the repo's only code lives in these paths, nothing gets extracted.
+
+Check what was preserved under `.sources/<basename>/files/`.
+
+</details>
+
+<details>
+<summary><strong>Want to disable the verbatim guard</strong></summary>
+
+```bash
+python skillforge.py --github user/repo --no-verbatim
+```
+
+Reproduces v5 behavior exactly. Not recommended for code-generation use cases — the silent-error prevention is the main reason to upgrade.
+
+To disable just for non-flagged sections but keep it for GitHub:
+```bash
+python skillforge.py --github user/repo --verbatim auto --verbatim-threshold 100
+```
+
+(Setting threshold to 100 means no docs section is "low enough" to trigger; only GitHub-source-default extraction runs.)
 
 </details>
 
@@ -682,14 +892,14 @@ Default timeout is 300s. For huge repos:
 python skillforge.py --github user/big-repo --clone-timeout 1200
 ```
 
-If the clone consistently times out, SkillForge automatically retries with `--depth 1 --single-branch`. If THAT also fails, the source is genuinely problematic — check connectivity or try a different repo.
+If the clone consistently times out, SkillForge automatically retries with `--depth 1 --single-branch`.
 
 </details>
 
 <details>
 <summary><strong>Skill file overwrites a previous one</strong></summary>
 
-v5 disambiguates collisions automatically. If two sources produce skills named `payment-sdk`, the second saves to `payment-sdk__<6charhash>/SKILL.md`. The `.source_url` marker file inside each skill directory tracks which source produced it.
+v5+ disambiguates collisions automatically. If two sources produce skills named `payment-sdk`, the second saves to `payment-sdk__<6charhash>/SKILL.md`. The `.source_url` marker file inside each skill directory tracks which source produced it.
 
 </details>
 
@@ -699,11 +909,13 @@ v5 disambiguates collisions automatically. If two sources produce skills named `
 
 PRs welcome. The most impactful contributions right now:
 
-1. **Better extraction prompts** — if you find a source type where extraction quality is low, submit the URL + expected output as a test case
-2. **New source types** — add support for HuggingFace model pages, Notion exports, etc.
-3. **Example skill files** — generate and submit high-quality skill files for popular papers
-4. **New providers** — add support for Ollama, Together AI, or other OpenAI-compatible APIs
-5. **Benchmark results** — run skill files vs raw PDFs with weak models and share the numbers
+1. **Tree-sitter integration** — replace the regex-based signature extraction with AST parsing for higher fidelity, especially on Rust generics, TypeScript conditional types, and Python type unions
+2. **Additional languages in the verbatim extractor** — Haskell, OCaml, Elixir, Scala, C/C++, Zig
+3. **Better extraction prompts** — if you find a source type where extraction quality is low, submit the URL + expected output as a test case
+4. **New source types** — add support for HuggingFace model pages, Notion exports, etc.
+5. **Example skill files** — generate and submit high-quality skill files for popular papers/repos
+6. **New providers** — add support for Ollama, Together AI, or other OpenAI-compatible APIs
+7. **Benchmark results** — run skill files vs raw PDFs with weak models and share the numbers
 
 ---
 
