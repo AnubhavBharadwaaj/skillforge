@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">🔨 SkillForge</h1>
+  <h1 align="center">🔨 Skillwright</h1>
   <p align="center"><strong>Turn any paper, repo, or docs site into a verified skill file your AI assistant can read — without silent code errors when it writes implementation code from those skills.</strong></p>
   <p align="center">
     <a href="#what-is-this">What is this?</a> •
@@ -16,12 +16,12 @@
 
 ## What is this?
 
-**Plain-English version:** You give SkillForge a URL — a paper, a GitHub repo, a docs site, anything — and it produces a single markdown file (`SKILL.md`) that captures everything your AI assistant needs to know about that source. Drop the file into your project, and Claude, Cursor, or any AI tool can read it as context.
+**Plain-English version:** You give Skillwright a URL — a paper, a GitHub repo, a docs site, anything — and it produces a single markdown file (`SKILL.md`) that captures everything your AI assistant needs to know about that source. Drop the file into your project, and Claude, Cursor, or any AI tool can read it as context.
 
-**Why it exists:** Reading a research paper and extracting the 12 formulas, 8 hyperparameters, and 3 known failure modes you actually need takes hours. SkillForge does this in one command. It also verifies the output line-by-line against the source, and — new in v6 — extracts the actual API surface verbatim from source files so the AI tool reading your skill never makes silent code errors from hallucinated method names.
+**Why it exists:** Reading a research paper and extracting the 12 formulas, 8 hyperparameters, and 3 known failure modes you actually need takes hours. Skillwright does this in one command. It also verifies the output line-by-line against the source, and — new in v6 — extracts the actual API surface verbatim from source files so the AI tool reading your skill never makes silent code errors from hallucinated method names.
 
 ```
-📄 Paper  ──→  SkillForge  ──→  SKILL.md             ← LLM-generated narrative
+📄 Paper  ──→  Skillwright  ──→  SKILL.md             ← LLM-generated narrative
 🐙 Repo                          VERIFICATION.md      ← every claim checked vs source
 🌐 Docs                          VERBATIM_REFERENCE.md ← literal source extraction (v6)
                                  │
@@ -30,7 +30,7 @@
 
 ### The key insight
 
-**A 4B model + SKILL.md outperforms a 70B model + raw PDF.** SkillForge uses a frontier model once to do the hard reading. After that, any model — even one running on your phone — gives answers with precision approaching frontier quality. The weaker the model, the bigger the gain.
+**A 4B model + SKILL.md outperforms a 70B model + raw PDF.** Skillwright uses a frontier model once to do the hard reading. After that, any model — even one running on your phone — gives answers with precision approaching frontier quality. The weaker the model, the bigger the gain.
 
 **The v6 corollary:** *A weak model + SKILL.md + VERBATIM_REFERENCE.md outperforms a frontier model writing from raw source code.* Even Opus-grade models hallucinate ~3–5% of method signatures when transcribing SDKs. The verbatim companion file pins exact identifiers so generated code compiles AND runs.
 
@@ -38,7 +38,7 @@
 
 ## Demo Video
 
-[![SkillForge Demo](https://img.youtube.com/vi/O0J55eRcwZw/maxresdefault.jpg)](https://www.youtube.com/watch?v=O0J55eRcwZw)
+[![Skillwright Demo](https://img.youtube.com/vi/O0J55eRcwZw/maxresdefault.jpg)](https://www.youtube.com/watch?v=O0J55eRcwZw)
 
 **[Watch the full demo →](https://www.youtube.com/watch?v=O0J55eRcwZw)**
 
@@ -72,19 +72,19 @@ export GITHUB_TOKEN="..."          # avoids the 60 req/hour anonymous limit
 
 ```bash
 # An arXiv paper
-python skillforge.py --arxiv 2103.13630
+python skillwright.py --arxiv 2103.13630
 
 # A GitHub repository (full clone, submodules, + verbatim API extraction)
-python skillforge.py --github https://github.com/wolfecameron/nanoMoE
+python skillwright.py --github https://github.com/wolfecameron/nanoMoE
 
 # A docs site (crawls every page in /docs)
-python skillforge.py --url https://docs.acedata.cloud
+python skillwright.py --url https://docs.acedata.cloud
 
 # A local PDF
-python skillforge.py --pdf paper.pdf
+python skillwright.py --pdf paper.pdf
 
 # A batch — process your whole reading list
-python skillforge.py batch --list sources.txt
+python skillwright.py batch --list sources.txt
 ```
 
 That's it. Output appears under `./skills/<source-name>/SKILL.md`, with `VERIFICATION.md` showing what was verified against the source. For code-bearing sources (GitHub repos, dangerous docs sections), a `VERBATIM_REFERENCE.md` companion file is generated automatically.
@@ -101,7 +101,7 @@ Copy the generated files into your project's `.claude/skills/<name>/`, `.cursorr
 
 ### The Verbatim Guard
 
-After verification, SkillForge looks at the per-section breakdown. If any section is flagged as **dangerous** — meaning low pct_verified AND a section name that suggests code content (`APIs`, `Functions`, `Methods`, `Configuration`, `Architecture`, `Endpoints`, `SDK`, `Integration`, `Implementation`, ...) — it triggers a second extraction pass that produces a **`VERBATIM_REFERENCE.md`** companion file.
+After verification, Skillwright looks at the per-section breakdown. If any section is flagged as **dangerous** — meaning low pct_verified AND a section name that suggests code content (`APIs`, `Functions`, `Methods`, `Configuration`, `Architecture`, `Endpoints`, `SDK`, `Integration`, `Implementation`, ...) — it triggers a second extraction pass that produces a **`VERBATIM_REFERENCE.md`** companion file.
 
 The verbatim file contains the actual API surface extracted character-for-character from the source files preserved on disk. **No LLM is in the loop.** It's pure pattern-matching:
 
@@ -339,13 +339,13 @@ For GitHub sources, the guard runs **regardless** of whether sections were flagg
 
 ## OpenRouter — Free Tier
 
-SkillForge's OpenRouter provider gives you access to dozens of models through a single API key, including completely free models.
+Skillwright's OpenRouter provider gives you access to dozens of models through a single API key, including completely free models.
 
 ### How it works
 
 1. **Live model discovery** — queries OpenRouter's API, filters for chat-capable models with ≥32K context
 2. **SQS ranking** — ranks models by Speed (30%), Completion Cap (20%), Context Length (15%), Capability (15%), Recency (10%), Reputation (10%)
-3. **Auto-rotation** — if a model rate-limits, SkillForge automatically rotates to the next one
+3. **Auto-rotation** — if a model rate-limits, Skillwright automatically rotates to the next one
 4. **Free → paid upgrade** — when free models are exhausted, auto-upgrades to cheap paid models
 
 ### Cost per source
@@ -357,7 +357,7 @@ SkillForge's OpenRouter provider gives you access to dozens of models through a 
 | Gemini | Direct | **Free tier available** | Generous limits |
 | Anthropic | Claude Sonnet | ~$0.15 | Higher quality, recommended for tricky sources |
 
-The Verbatim Guard adds **zero LLM cost** — it's pure filesystem extraction from the source bundles SkillForge already preserves on disk. Runtime impact is ~0.5–2 seconds per source.
+The Verbatim Guard adds **zero LLM cost** — it's pure filesystem extraction from the source bundles Skillwright already preserves on disk. Runtime impact is ~0.5–2 seconds per source.
 
 ---
 
@@ -378,7 +378,7 @@ Tested with Gemini 2.5 Flash (default). All runs automated, no manual editing.
 
 For the quantization survey (33 pages, 13 equations, 8 result tables):
 
-| | Manual Reading | SkillForge v6 |
+| | Manual Reading | Skillwright v6 |
 | --- | --- | --- |
 | **Time** | 6–8 hours | 2.7 minutes |
 | **Lines produced** | 455 | 550 |
@@ -405,7 +405,7 @@ The real value isn't competing with frontier models on raw PDFs — it's making 
 
 Reading a quantization paper takes **4 hours**. Extracting the 12 formulas, 8 hyperparameters, and 3 known failure modes you actually need takes **another 2 hours**. Multiply by 20 papers per project.
 
-SkillForge does this in one command. The output is structured so Claude, GPT, Cursor, or Copilot can use it directly as context — and v6 ensures it can write working code from those skills without hallucinated API calls.
+Skillwright does this in one command. The output is structured so Claude, GPT, Cursor, or Copilot can use it directly as context — and v6 ensures it can write working code from those skills without hallucinated API calls.
 
 ### Why not just upload the PDF to Claude?
 
@@ -424,7 +424,7 @@ Claude reads PDFs excellently. But:
 ## All Options
 
 ```
-python skillforge.py [OPTIONS]
+python skillwright.py [OPTIONS]
 
 Input (pick one):
   --url URL           Any URL (HTML page, llms.txt, PDF, ...)
@@ -474,7 +474,7 @@ GitHub:
   --max-org-repos N      Max repos to clone from an org URL (default: 25)
 
 Batch:
-  skillforge.py batch --list sources.txt [--delay 5] [other flags]
+  skillwright.py batch --list sources.txt [--delay 5] [other flags]
 ```
 
 ---
@@ -484,7 +484,7 @@ Batch:
 ### Example: A docs site
 
 ```bash
-python skillforge.py --url https://docs.acedata.cloud --crawl-pages 50
+python skillwright.py --url https://docs.acedata.cloud --crawl-pages 50
 ```
 
 What happens:
@@ -498,7 +498,7 @@ What happens:
 ### Example: A GitHub repository (v6 verbatim guard always fires)
 
 ```bash
-python skillforge.py --github https://github.com/AceDataCloud/X402Client
+python skillwright.py --github https://github.com/AceDataCloud/X402Client
 ```
 
 ```
@@ -523,7 +523,7 @@ Result: even though the LLM paraphrased ~30% of the API signatures in the SKILL.
 # https://docs.acedata.cloud/llms.txt
 # https://arxiv.org/abs/2511.15712
 
-python skillforge.py batch --list sources.txt --json > results.jsonl
+python skillwright.py batch --list sources.txt --json > results.jsonl
 ```
 
 What happens:
@@ -692,7 +692,7 @@ See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specific
 
 ## Comparison
 
-| | SkillForge v6 | Papers With Code | Elicit | ChatPDF | Manual Reading |
+| | Skillwright v6 | Papers With Code | Elicit | ChatPDF | Manual Reading |
 | --- | --- | --- | --- | --- | --- |
 | **Output** | Verified skill + verbatim ref | Links to repos | Summaries | Chat session | Notes (maybe) |
 | **Source coverage** | Papers, repos, docs, PRs, llms.txt | Papers + code | Papers | Single doc | Anything |
@@ -719,7 +719,7 @@ See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specific
 
 **Web3 / Protocol Teams** — Ingest protocol specs, reference implementations (full GitHub orgs), and docs sites into a single skill library. The v6 verbatim guard ensures generated payment/contract code uses the actual SDK methods, not paraphrased ones. PR URLs let your AI track active proposals.
 
-**Weak Model Users** — Can't afford frontier API costs? Extract skill files once with SkillForge's free tier, then use them with Ollama, llama.cpp, or any local model. A 4B model with skill files plus verbatim references gives precise, runtime-correct answers that a 70B model with raw PDFs can't match.
+**Weak Model Users** — Can't afford frontier API costs? Extract skill files once with Skillwright's free tier, then use them with Ollama, llama.cpp, or any local model. A 4B model with skill files plus verbatim references gives precise, runtime-correct answers that a 70B model with raw PDFs can't match.
 
 **Bounty / Hackathon Participants** — When you have 7 days to ship a working autonomous agent on top of a stack you've never used, the verbatim references mean your AI assistant writes code that compiles AND runs the first time. Saves the typical "debug hallucinated method names for 4 hours" tax.
 
@@ -730,8 +730,8 @@ See [docs/SKILL_FORMAT_SPEC.md](docs/SKILL_FORMAT_SPEC.md) for the full specific
 ## Project Structure
 
 ```
-skillforge-ai/
-├── skillforge.py          # The complete tool (single file, ~2920 lines)
+skillwright-ai/
+├── skillwright.py          # The complete tool (single file, ~2920 lines)
 ├── requirements.txt       # See dependencies below
 ├── README.md
 ├── LICENSE
@@ -751,7 +751,7 @@ skillforge-ai/
 │           ├── VERIFICATION.md
 │           └── VERBATIM_REFERENCE.md      ← v6
 ├── notebooks/
-│   └── SkillForge_Demo.ipynb
+│   └── Skillwright_Demo.ipynb
 ├── benchmark/
 │   ├── benchmark.py
 │   └── benchmark.jsx
@@ -824,7 +824,7 @@ Install the browser binary:
 playwright install chromium
 ```
 
-If Playwright still fails, SkillForge automatically falls back to `requests` for HTML fetching.
+If Playwright still fails, Skillwright automatically falls back to `requests` for HTML fetching.
 
 For debugging, run with `--no-headless` to watch the browser.
 
@@ -870,14 +870,14 @@ Check what was preserved under `.sources/<basename>/files/`.
 <summary><strong>Want to disable the verbatim guard</strong></summary>
 
 ```bash
-python skillforge.py --github user/repo --no-verbatim
+python skillwright.py --github user/repo --no-verbatim
 ```
 
 Reproduces v5 behavior exactly. Not recommended for code-generation use cases — the silent-error prevention is the main reason to upgrade.
 
 To disable just for non-flagged sections but keep it for GitHub:
 ```bash
-python skillforge.py --github user/repo --verbatim auto --verbatim-threshold 100
+python skillwright.py --github user/repo --verbatim auto --verbatim-threshold 100
 ```
 
 (Setting threshold to 100 means no docs section is "low enough" to trigger; only GitHub-source-default extraction runs.)
@@ -889,10 +889,10 @@ python skillforge.py --github user/repo --verbatim auto --verbatim-threshold 100
 
 Default timeout is 300s. For huge repos:
 ```bash
-python skillforge.py --github user/big-repo --clone-timeout 1200
+python skillwright.py --github user/big-repo --clone-timeout 1200
 ```
 
-If the clone consistently times out, SkillForge automatically retries with `--depth 1 --single-branch`.
+If the clone consistently times out, Skillwright automatically retries with `--depth 1 --single-branch`.
 
 </details>
 

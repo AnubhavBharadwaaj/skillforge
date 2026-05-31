@@ -15,11 +15,6 @@ SKILL_prev_*.md
 .ipynb_checkpoints/
 *.zip
 run_demo.sh
-scene1_arxiv.tape
-scene2_scroll.tape
-scene3_github.tape
-scene4_batch.tape
-skillforge_demo.tape
 RECORDING_GUIDE.md
 sources.txt
 *.tape

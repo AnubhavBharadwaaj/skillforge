@@ -1,4 +1,4 @@
-# SkillForge Sample Sources — one per line
+# Skillwright Sample Sources — one per line
 # Supports: arXiv IDs, GitHub URLs, local PDF paths
 
 # Quantization & Compression

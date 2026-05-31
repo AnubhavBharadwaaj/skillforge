@@ -6,7 +6,7 @@ openai>=1.50.0          # only needed when --provider openrouter
 # PDF + arXiv
 PyMuPDF>=1.24.0
 
-# Web fetching (used by skillforge_complete.py)
+# Web fetching (used by skillwright.py)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 html2text>=2024.2.26
