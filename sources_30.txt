@@ -1,4 +1,4 @@
-# SkillWright — 30 Paper Compression/Efficiency Library
+# Skillwright — 30 Paper Compression/Efficiency Library
 # Quantization (10)
 2103.13630
 1712.05877
